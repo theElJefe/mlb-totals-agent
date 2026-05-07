@@ -1,7 +1,4 @@
-streamlit
-pandas
-numpy
-requests
-MLB-StatsAPI
-pybaseball
-scipy
+streamlit>=1.35.0
+MLB-StatsAPI>=1.7.2
+requests>=2.31.0
+pytz>=2024.1
