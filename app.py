@@ -283,12 +283,67 @@ def fetch_umpire_placeholder():
 
 
 def merge_all(schedule_df, odds_df, weather_df):
+    schedule_df = schedule_df.copy().reset_index(drop=True) if schedule_df is not None else pd.DataFrame()
+    odds_df = odds_df.copy().reset_index(drop=True) if odds_df is not None and not odds_df.empty else pd.DataFrame()
+    weather_df = weather_df.copy().reset_index(drop=True) if weather_df is not None and not weather_df.empty else pd.DataFrame()
+
     if schedule_df.empty and odds_df.empty:
         return pd.DataFrame()
-    merged = schedule_df.merge(odds_df, on=["home_team", "away_team"], how="left") if not odds_df.empty else schedule_df.copy()
-    merged = merged.merge(weather_df, on="home_team", how="left") if not weather_df.empty else merged
-    merged["display_time"] = merged["game_datetime_et"].combine_first(merged.get("commence_time_et"))
-    return merged.sort_values("display_time")
+
+    if not schedule_df.empty:
+        schedule_df.columns = [str(c) for c in schedule_df.columns]
+    if not odds_df.empty:
+        odds_df.columns = [str(c) for c in odds_df.columns]
+    if not weather_df.empty:
+        weather_df.columns = [str(c) for c in weather_df.columns]
+
+    required_sched = ["home_team", "away_team"]
+    required_weather = ["home_team"]
+
+    for col in required_sched:
+        if col not in schedule_df.columns and not schedule_df.empty:
+            schedule_df[col] = None
+        if col not in odds_df.columns and not odds_df.empty:
+            odds_df[col] = None
+    for col in required_weather:
+        if col not in weather_df.columns and not weather_df.empty:
+            weather_df[col] = None
+
+    if not schedule_df.empty:
+        schedule_df["home_team"] = schedule_df["home_team"].astype("string").str.strip()
+        schedule_df["away_team"] = schedule_df["away_team"].astype("string").str.strip()
+    if not odds_df.empty:
+        odds_df["home_team"] = odds_df["home_team"].astype("string").str.strip()
+        odds_df["away_team"] = odds_df["away_team"].astype("string").str.strip()
+    if not weather_df.empty:
+        weather_df["home_team"] = weather_df["home_team"].astype("string").str.strip()
+        weather_df = weather_df.drop_duplicates(subset=["home_team"], keep="first")
+
+    if schedule_df.empty:
+        merged = odds_df.copy()
+    elif odds_df.empty:
+        merged = schedule_df.copy()
+    else:
+        merged = schedule_df.merge(
+            odds_df,
+            on=["home_team", "away_team"],
+            how="left",
+            validate="1:1"
+        )
+
+    if not weather_df.empty:
+        merged = merged.merge(weather_df, on="home_team", how="left", validate="m:1")
+
+    if "game_datetime_et" not in merged.columns:
+        merged["game_datetime_et"] = pd.NaT
+    if "commence_time_et" not in merged.columns:
+        merged["commence_time_et"] = pd.NaT
+
+    merged["game_datetime_et"] = pd.to_datetime(merged["game_datetime_et"], errors="coerce")
+    merged["commence_time_et"] = pd.to_datetime(merged["commence_time_et"], errors="coerce")
+    merged["display_time"] = merged["game_datetime_et"].fillna(merged["commence_time_et"])
+
+    return merged.sort_values("display_time", na_position="last").reset_index(drop=True)
 
 
 def recommendation_from_market(over_price, under_price):
@@ -341,6 +396,20 @@ except Exception:
     team_bat, team_pit = pd.DataFrame(), pd.DataFrame()
 ump_info = fetch_umpire_placeholder()
 merged = merge_all(schedule_df, odds_df, weather_df)
+
+with st.expander("Debug dataframes"):
+    st.write("schedule_df shape", getattr(schedule_df, "shape", None))
+    st.write("schedule_df columns", list(schedule_df.columns) if hasattr(schedule_df, "columns") else None)
+    st.write(schedule_df.head(3) if hasattr(schedule_df, "head") else None)
+    st.write("odds_df shape", getattr(odds_df, "shape", None))
+    st.write("odds_df columns", list(odds_df.columns) if hasattr(odds_df, "columns") else None)
+    st.write(odds_df.head(3) if hasattr(odds_df, "head") else None)
+    st.write("weather_df shape", getattr(weather_df, "shape", None))
+    st.write("weather_df columns", list(weather_df.columns) if hasattr(weather_df, "columns") else None)
+    st.write(weather_df.head(3) if hasattr(weather_df, "head") else None)
+    st.write("merged shape", getattr(merged, "shape", None))
+    st.write("merged columns", list(merged.columns) if hasattr(merged, "columns") else None)
+    st.write(merged.head(5) if hasattr(merged, "head") else None)
 
 if merged.empty:
     st.warning("No games loaded yet. Add your Odds API key and confirm games are on the board.")
