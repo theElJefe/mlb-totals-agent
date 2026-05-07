@@ -1,478 +1,449 @@
-import streamlit as st
-import statsapi
-import requests
-from datetime import datetime, timedelta, timezone
-import pytz
-import json
 import os
+import json
+from datetime import datetime, timedelta
 
-st.set_page_config(
-    page_title="MLB Totals Bet Tracker",
-    page_icon="⚾",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+import numpy as np
+import pandas as pd
+import requests
+import statsapi
+import streamlit as st
+import pytz
+from pybaseball import batting_stats, pitching_stats, schedule_and_record
 
-# ── Mobile-friendly CSS ────────────────────────────────────────────────────────
+st.set_page_config(page_title="MLB Totals Bet Tracker", page_icon="⚾", layout="wide")
+
+ET = pytz.timezone("America/New_York")
+DATA_FILE = "bet_log.json"
+SPORT_KEY = "baseball_mlb"
+
 st.markdown("""
 <style>
-  /* Tighter padding on mobile */
-  .block-container { padding: 0.75rem 0.75rem 2rem; }
-  /* Card styling */
-  .bet-card {
-    background: #1e1e2e;
-    border: 1px solid #313244;
-    border-radius: 10px;
-    padding: 14px;
-    margin-bottom: 12px;
-  }
-  .bet-card h4 { margin: 0 0 6px; font-size: 1.05rem; color: #cdd6f4; }
-  .field-label { color: #a6adc8; font-size: 0.78rem; text-transform: uppercase; letter-spacing: .04em; }
-  .field-value { color: #cdd6f4; font-size: 0.92rem; margin-bottom: 8px; }
-  .tag-over  { background:#a6e3a1; color:#1e1e2e; border-radius:4px; padding:2px 6px; font-size:.75rem; font-weight:700; }
-  .tag-under { background:#f38ba8; color:#1e1e2e; border-radius:4px; padding:2px 6px; font-size:.75rem; font-weight:700; }
-  .tag-pass  { background:#585b70; color:#cdd6f4; border-radius:4px; padding:2px 6px; font-size:.75rem; font-weight:700; }
-  .tier-pass { color:#f38ba8; font-weight:700; }
-  .tier-ok   { color:#a6e3a1; font-weight:700; }
-  .tier-warn { color:#fab387; font-weight:700; }
-  /* Checklist row */
-  .chk-row { display:flex; justify-content:space-between; align-items:center;
-             padding:4px 0; border-bottom:1px solid #313244; font-size:.85rem; }
-  .chk-row:last-child { border-bottom:none; }
-  .score-box {
-    background:#181825; border:1px solid #313244; border-radius:8px;
-    padding:10px; margin-top:8px; text-align:center;
-  }
-  .score-num { font-size:2.2rem; font-weight:900; }
-  .score-pos { color:#a6e3a1; }
-  .score-neg { color:#f38ba8; }
-  .score-neu { color:#fab387; }
+.block-container {padding-top: 1rem; padding-bottom: 2rem;}
+.bet-card {border:1px solid #2d3748;border-radius:12px;padding:14px;margin-bottom:12px;background:#111827;}
+.small-label {font-size:.78rem;color:#9ca3af;text-transform:uppercase;letter-spacing:.03em;}
+.big-value {font-size:1rem;color:#f3f4f6;font-weight:600;}
+.muted {color:#cbd5e1;}
+.good {color:#34d399;font-weight:700;}
+.bad {color:#f87171;font-weight:700;}
+.warn {color:#fbbf24;font-weight:700;}
+.tag {display:inline-block;padding:3px 8px;border-radius:999px;font-size:.78rem;font-weight:700;}
+.tag-over {background:#064e3b;color:#d1fae5;}
+.tag-under {background:#7f1d1d;color:#fee2e2;}
+.tag-pass {background:#374151;color:#e5e7eb;}
 </style>
 """, unsafe_allow_html=True)
 
-# ── Persistent storage (JSON file) ────────────────────────────────────────────
-DATA_FILE = "bet_log.json"
+TEAM_TO_ABBR = {
+    "Arizona Diamondbacks":"ARI","Atlanta Braves":"ATL","Baltimore Orioles":"BAL",
+    "Boston Red Sox":"BOS","Chicago Cubs":"CHC","Chicago White Sox":"CWS",
+    "Cincinnati Reds":"CIN","Cleveland Guardians":"CLE","Colorado Rockies":"COL",
+    "Detroit Tigers":"DET","Houston Astros":"HOU","Kansas City Royals":"KC",
+    "Los Angeles Angels":"LAA","Los Angeles Dodgers":"LAD","Miami Marlins":"MIA",
+    "Milwaukee Brewers":"MIL","Minnesota Twins":"MIN","New York Mets":"NYM",
+    "New York Yankees":"NYY","Athletics":"ATH","Oakland Athletics":"OAK",
+    "Philadelphia Phillies":"PHI","Pittsburgh Pirates":"PIT","San Diego Padres":"SD",
+    "San Francisco Giants":"SF","Seattle Mariners":"SEA","St. Louis Cardinals":"STL",
+    "Tampa Bay Rays":"TB","Texas Rangers":"TEX","Toronto Blue Jays":"TOR",
+    "Washington Nationals":"WSH"
+}
+BALLPARK_COORDS = {
+    "Arizona Diamondbacks": (33.4453, -112.0667), "Atlanta Braves": (33.8908, -84.4677),
+    "Baltimore Orioles": (39.2839, -76.6217), "Boston Red Sox": (42.3467, -71.0972),
+    "Chicago Cubs": (41.9484, -87.6553), "Chicago White Sox": (41.8300, -87.6339),
+    "Cincinnati Reds": (39.0974, -84.5061), "Cleveland Guardians": (41.4962, -81.6852),
+    "Colorado Rockies": (39.7559, -104.9942), "Detroit Tigers": (42.3390, -83.0485),
+    "Houston Astros": (29.7573, -95.3555), "Kansas City Royals": (39.0517, -94.4803),
+    "Los Angeles Angels": (33.8003, -117.8827), "Los Angeles Dodgers": (34.0739, -118.2400),
+    "Miami Marlins": (25.7781, -80.2197), "Milwaukee Brewers": (43.0280, -87.9712),
+    "Minnesota Twins": (44.9817, -93.2776), "New York Mets": (40.7571, -73.8458),
+    "New York Yankees": (40.8296, -73.9262), "Athletics": (38.2000, -121.4900),
+    "Oakland Athletics": (37.7516, -122.2005), "Philadelphia Phillies": (39.9061, -75.1665),
+    "Pittsburgh Pirates": (40.4469, -80.0057), "San Diego Padres": (32.7073, -117.1566),
+    "San Francisco Giants": (37.7786, -122.3893), "Seattle Mariners": (47.5914, -122.3325),
+    "St. Louis Cardinals": (38.6226, -90.1928), "Tampa Bay Rays": (27.7682, -82.6534),
+    "Texas Rangers": (32.7513, -97.0825), "Toronto Blue Jays": (43.6414, -79.3894),
+    "Washington Nationals": (38.8730, -77.0074)
+}
+
 
 def load_data():
     if os.path.exists(DATA_FILE):
-        with open(DATA_FILE) as f:
+        with open(DATA_FILE, "r") as f:
             return json.load(f)
     return {}
 
-def save_data(d):
+
+def save_data(data):
     with open(DATA_FILE, "w") as f:
-        json.dump(d, f, indent=2)
+        json.dump(data, f, indent=2)
 
-bet_log = load_data()
 
-# ── Helper: fetch 72-hour schedule ────────────────────────────────────────────
-ET = pytz.timezone("America/New_York")
+def team_abbr(name):
+    return TEAM_TO_ABBR.get(name, (name or "")[:3].upper())
+
+
+def american_to_decimal(odds):
+    if odds is None:
+        return None
+    return 1 + (odds / 100 if odds > 0 else 100 / abs(odds))
+
+
+def implied_prob_from_american(odds):
+    if odds is None:
+        return None
+    return (100 / (odds + 100)) if odds > 0 else (abs(odds) / (abs(odds) + 100))
+
+
+def no_vig_fair_probs(over_price, under_price):
+    po = implied_prob_from_american(over_price)
+    pu = implied_prob_from_american(under_price)
+    if po is None or pu is None or po + pu == 0:
+        return None, None
+    total = po + pu
+    return po / total, pu / total
+
+
+def prob_to_american(p):
+    if p is None or p <= 0 or p >= 1:
+        return None
+    return int(round(-(p / (1 - p)) * 100)) if p >= 0.5 else int(round(((1 - p) / p) * 100))
+
+
+def quarter_kelly(bankroll, fair_prob, offered_odds):
+    dec = american_to_decimal(offered_odds)
+    if not dec or fair_prob is None:
+        return 0.0
+    b = dec - 1
+    p = fair_prob
+    q = 1 - p
+    k = ((b * p) - q) / b if b > 0 else 0
+    return max(0.0, bankroll * (k / 4))
+
 
 @st.cache_data(ttl=900)
-def fetch_games_72h():
+def fetch_schedule_72h():
     now_et = datetime.now(ET)
     end_et = now_et + timedelta(hours=72)
-    start_str = now_et.strftime("%m/%d/%Y")
-    end_str   = end_et.strftime("%m/%d/%Y")
-    try:
-        games = statsapi.schedule(start_date=start_str, end_date=end_str)
-    except Exception as e:
-        st.error(f"MLB API error: {e}")
-        return []
-    # Filter only scheduled / warmup / live
-    live_statuses = {"Scheduled", "Pre-Game", "Warmup", "In Progress"}
-    out = []
+    games = statsapi.schedule(start_date=now_et.strftime("%m/%d/%Y"), end_date=end_et.strftime("%m/%d/%Y"))
+    rows = []
     for g in games:
         if g.get("game_type") != "R":
             continue
         try:
-            gdt = datetime.fromisoformat(g["game_datetime"].replace("Z", "+00:00"))
-            gdt_et = gdt.astimezone(ET)
+            dt = datetime.fromisoformat(g["game_datetime"].replace("Z", "+00:00")).astimezone(ET)
         except Exception:
             continue
-        if gdt_et < now_et:
+        if dt < now_et:
             continue
-        g["game_datetime_et"] = gdt_et
-        out.append(g)
-    out.sort(key=lambda x: x["game_datetime_et"])
-    return out
+        rows.append({
+            "game_id": g.get("game_id"),
+            "home_team": g.get("home_name"),
+            "away_team": g.get("away_name"),
+            "home_pitcher": g.get("home_probable_pitcher") or "TBD",
+            "away_pitcher": g.get("away_probable_pitcher") or "TBD",
+            "game_datetime_et": dt,
+        })
+    return pd.DataFrame(rows)
 
-def abbrev(team_name: str) -> str:
-    ABBR = {
-        "Arizona Diamondbacks":"ARI","Atlanta Braves":"ATL","Baltimore Orioles":"BAL",
-        "Boston Red Sox":"BOS","Chicago Cubs":"CHC","Chicago White Sox":"CWS",
-        "Cincinnati Reds":"CIN","Cleveland Guardians":"CLE","Colorado Rockies":"COL",
-        "Detroit Tigers":"DET","Houston Astros":"HOU","Kansas City Royals":"KC",
-        "Los Angeles Angels":"LAA","Los Angeles Dodgers":"LAD","Miami Marlins":"MIA",
-        "Milwaukee Brewers":"MIL","Minnesota Twins":"MIN","New York Mets":"NYM",
-        "New York Yankees":"NYY","Oakland Athletics":"OAK","Philadelphia Phillies":"PHI",
-        "Pittsburgh Pirates":"PIT","San Diego Padres":"SD","San Francisco Giants":"SF",
-        "Seattle Mariners":"SEA","St. Louis Cardinals":"STL","Tampa Bay Rays":"TB",
-        "Texas Rangers":"TEX","Toronto Blue Jays":"TOR","Washington Nationals":"WSH",
-        "Athletics":"ATH",
-    }
-    for k, v in ABBR.items():
-        if k in team_name:
-            return v
-    return team_name[:3].upper()
 
-def game_label(g):
-    away = abbrev(g["away_name"])
-    home = abbrev(g["home_name"])
-    dt   = g["game_datetime_et"]
-    return f"{away} @ {home}  {dt.strftime('%-m/%-d %I:%M%p ET').replace('AM','am').replace('PM','pm')}"
+@st.cache_data(ttl=300)
+def fetch_odds(api_key, regions="us", markets="totals", bookmakers=""):
+    if not api_key:
+        return pd.DataFrame()
+    params = {"apiKey": api_key, "regions": regions, "markets": markets, "oddsFormat": "american"}
+    if bookmakers.strip():
+        params["bookmakers"] = bookmakers.strip()
+    r = requests.get(f"https://api.the-odds-api.com/v4/sports/{SPORT_KEY}/odds", params=params, timeout=20)
+    r.raise_for_status()
+    rows = []
+    for event in r.json():
+        best_over = best_under = None
+        total_point = None
+        pinnacle_over = pinnacle_under = None
+        for bk in event.get("bookmakers", []):
+            for market in bk.get("markets", []):
+                if market.get("key") != "totals":
+                    continue
+                over = next((o for o in market.get("outcomes", []) if o.get("name") == "Over"), None)
+                under = next((o for o in market.get("outcomes", []) if o.get("name") == "Under"), None)
+                if not over or not under:
+                    continue
+                if total_point is None:
+                    total_point = over.get("point")
+                if best_over is None or (over.get("price") or -9999) > (best_over.get("price") or -9999):
+                    best_over = {"price": over.get("price"), "book": bk.get("title")}
+                if best_under is None or (under.get("price") or -9999) > (best_under.get("price") or -9999):
+                    best_under = {"price": under.get("price"), "book": bk.get("title")}
+                if bk.get("key") == "pinnacle":
+                    pinnacle_over = over.get("price")
+                    pinnacle_under = under.get("price")
+        rows.append({
+            "event_id": event.get("id"),
+            "home_team": event.get("home_team"),
+            "away_team": event.get("away_team"),
+            "commence_time_et": datetime.fromisoformat(event.get("commence_time").replace("Z", "+00:00")).astimezone(ET) if event.get("commence_time") else None,
+            "market_total": total_point,
+            "over_price": best_over.get("price") if best_over else None,
+            "under_price": best_under.get("price") if best_under else None,
+            "best_over_book": best_over.get("book") if best_over else None,
+            "best_under_book": best_under.get("book") if best_under else None,
+            "pinnacle_over": pinnacle_over,
+            "pinnacle_under": pinnacle_under,
+        })
+    return pd.DataFrame(rows)
 
-def game_key(g):
-    return str(g["game_id"])
 
-# ── Checklist engine ───────────────────────────────────────────────────────────
-CHECKLIST_T1 = [
-    ("1.1.1", "Line active / not stale (Pinnacle moving)?"),
-    ("1.1.2", "Game confirmed (no postponement risk)?"),
-    ("1.1.3", "Starting pitcher confirmed on both sides?"),
-    ("1.1.4", "Plate umpire known (UmpScorecards checked)?"),
-    ("1.1.5", "Roof/weather not a binary blowout factor?"),
-    ("1.2.1", "No relevant SP injury report in last 6h?"),
-    ("1.2.2", "SP on normal rest (≥4 days)?"),
-    ("1.2.3", "SP pitch count trend normal (not fatigued)?"),
-    ("1.2.4", "No concerning postgame quotes from SP?"),
-    ("1.2.5", "Opener/bulk arm confirmed if bullpen game?"),
-    ("1.3.1", "Confirmed lineup posted (both sides)?"),
-    ("1.3.2", "No key bat scratched vs platoon advantage?"),
-    ("1.4.1", "Wind ≤12 mph OR direction neutral for park?"),
-    ("1.4.2", "Temp reasonable (45°F–95°F range)?"),
-    ("1.4.3", "No rain delay risk >30%?"),
-]
+@st.cache_data(ttl=1800)
+def fetch_weather_for_games(home_teams):
+    rows = []
+    for team in home_teams:
+        coords = BALLPARK_COORDS.get(team)
+        if not coords:
+            rows.append({"home_team": team, "temp_f": None, "wind_mph": None, "wind_dir": None, "weather_note": "Ballpark coords unavailable"})
+            continue
+        lat, lon = coords
+        try:
+            url = "https://api.open-meteo.com/v1/forecast"
+            params = {
+                "latitude": lat,
+                "longitude": lon,
+                "hourly": "temperature_2m,windspeed_10m,winddirection_10m,precipitation_probability",
+                "temperature_unit": "fahrenheit",
+                "windspeed_unit": "mph",
+                "forecast_days": 3,
+                "timezone": "America/New_York",
+            }
+            r = requests.get(url, params=params, timeout=20)
+            r.raise_for_status()
+            js = r.json()
+            hourly = js.get("hourly", {})
+            if not hourly or not hourly.get("time"):
+                rows.append({"home_team": team, "temp_f": None, "wind_mph": None, "wind_dir": None, "weather_note": "No weather data"})
+                continue
+            rows.append({
+                "home_team": team,
+                "temp_f": hourly.get("temperature_2m", [None])[0],
+                "wind_mph": hourly.get("windspeed_10m", [None])[0],
+                "wind_dir": hourly.get("winddirection_10m", [None])[0],
+                "precip_pct": hourly.get("precipitation_probability", [None])[0],
+                "weather_note": "Auto-pulled via Open-Meteo"
+            })
+        except Exception:
+            rows.append({"home_team": team, "temp_f": None, "wind_mph": None, "wind_dir": None, "precip_pct": None, "weather_note": "Weather pull failed"})
+    return pd.DataFrame(rows)
 
-CHECKLIST_T2 = [
-    ("2.1.1",  "SP xERA vs ERA gap checked (luck-adjusted)?"),
-    ("2.1.2",  "SP BABIP & LOB% regression flags cleared?"),
-    ("2.1.3",  "SP velo/spin trending normal L5 starts?"),
-    ("2.1.4",  "SP arm angle no recent mechanical change?"),
-    ("2.1.5",  "Stuff+/Pitching+ within normal range?"),
-    ("2.1.6",  "SP CSW% / Chase% / Whiff% trending OK?"),
-    ("2.1.7",  "SP home/road & day/night splits considered?"),
-    ("2.1.8",  "SP 1st-inning ERA vs rest-of-game noted?"),
-    ("2.1.9",  "TTOP: 3rd time through order risk assessed?"),
-    ("2.1.10", "Short-series familiarity cycle checked (2.1.18)?"),
-    ("2.2.1",  "Bullpen usage logs checked last 3 days?"),
-    ("2.2.2",  "No closer/setup arm taxed 3+ days in a row?"),
-    ("2.2.3",  "Bullpen ERA/xFIP vs season norm?"),
-    ("2.3.1",  "Lineup wRC+ vs LHP/RHP split applied?"),
-    ("2.3.2",  "Recent L14d vs season avg hot/cold flag?"),
-    ("2.3.3",  "Bat speed / swing decision trend checked?"),
-    ("2.3.4",  "Lineup protection quality assessed?"),
-    ("2.4.1",  "Park HR factor applied to run total?"),
-    ("2.4.2",  "Marine layer flag checked (if West Coast night)?"),
-    ("2.5.1",  "Ump zone size / run impact estimated?"),
-    ("2.5.2",  "ABS-exempt game flag cleared?"),
-]
 
-CHECKLIST_T3 = [
-    ("3.1.1", "xRuns vs actual runs regression flag?"),
-    ("3.1.2", "HR/FB rate luck regression checked?"),
-    ("3.1.3", "RISP wOBA vs overall wOBA divergence?"),
-    ("3.2.1", "Schedule fatigue / travel considered?"),
-    ("3.3.1", "Sharp money / steam move direction confirmed?"),
-    ("3.3.2", "Line movement consistent with your side?"),
-    ("3.3.3", "F5 vs full-game divergence play assessed?"),
-    ("3.3.4", "RLM (reverse line movement) check done?"),
-    ("3.4.1", "CLV benchmark (Pinnacle no-vig) set pre-bet?"),
-]
+@st.cache_data(ttl=14400)
+def fetch_team_metrics(season):
+    bat = batting_stats(season, season)
+    pit = pitching_stats(season, season)
+    bat = bat[[c for c in ["Team", "Name", "PA", "wRC+", "K%", "BB%", "ISO", "wOBA"] if c in bat.columns]]
+    pit = pit[[c for c in ["Team", "Name", "IP", "ERA", "xERA", "FIP", "WHIP", "K/9", "BB/9"] if c in pit.columns]]
+    team_bat = bat.groupby("Team", as_index=False).agg({"PA":"sum", "wRC+":"mean", "K%":"mean", "BB%":"mean", "ISO":"mean", "wOBA":"mean"}) if not bat.empty else pd.DataFrame()
+    team_pit = pit.groupby("Team", as_index=False).agg({"IP":"sum", "ERA":"mean", "xERA":"mean", "FIP":"mean", "WHIP":"mean", "K/9":"mean", "BB/9":"mean"}) if not pit.empty else pd.DataFrame()
+    return team_bat, team_pit
 
-RUN_ADJ_FACTORS = {
-    "Wind +": ("Wind blowing OUT strongly (≥15 mph)", +0.40),
-    "Wind -": ("Wind blowing IN strongly (≥15 mph)", -0.35),
-    "Temp +": ("Very hot game (≥90°F)", +0.20),
-    "Temp -": ("Cold game (≤45°F)", -0.20),
-    "Marine": ("Marine layer confirmed (West Coast night)", -0.12),
-    "Ump +":  ("Ump large zone — pitcher favored", -0.20),
-    "Ump -":  ("Ump small zone — hitter favored", +0.20),
-    "Park +":  ("High run-environment park (COL, CIN, etc.)", +0.30),
-    "Park -":  ("Low run-environment park (SD, OAK, etc.)", -0.20),
-    "Bull +":  ("Both bullpens fresh / lights out", -0.25),
-    "Bull -":  ("Both bullpens depleted", +0.30),
-    "F5 div": ("F5/Full-game divergence play active", +0.15),
-    "Famil":  ("Short-series familiarity boost (2nd facing)", +0.10),
-    "BatSpd-": ("Bat speed declining L14d both lineups", -0.10),
-    "LinePro-":("Lineup protection broken (cleanup <.340 wOBA)", -0.08),
-    "Sharp O": ("Sharp steam on Over", +0.20),
-    "Sharp U": ("Sharp steam on Under", -0.20),
-}
 
-KELLY_TABLE = {
-    "2%": 0.02, "3%": 0.03, "4%": 0.04, "5%": 0.05,
-    "6%": 0.06, "7%": 0.07, "8%": 0.08, "10%": 0.10,
-}
+@st.cache_data(ttl=7200)
+def bullpen_fatigue_score(team_abbr_code, season):
+    try:
+        df = schedule_and_record(season, team_abbr_code)
+        if df is None or df.empty or "Date" not in df.columns:
+            return None, "No schedule data"
+        recent = df.tail(5).copy()
+        games_3 = min(len(recent.tail(3)), 3)
+        games_5 = min(len(recent), 5)
+        score = round((games_3 * 0.6 + games_5 * 0.2), 2)
+        note = f"Proxy fatigue from last {games_5} team games"
+        return score, note
+    except Exception:
+        return None, "Bullpen proxy unavailable"
 
-def kelly_stake(bankroll: float, edge_pct: float, odds_american: int) -> float:
-    if odds_american < 0:
-        implied = (-odds_american) / (-odds_american + 100)
-    else:
-        implied = 100 / (odds_american + 100)
-    b = (1 / implied) - 1
-    p = implied + edge_pct
-    q = 1 - p
-    full_kelly = (b * p - q) / b
-    return max(0.0, full_kelly / 4) * bankroll
 
-# ── Main UI ────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=43200)
+def fetch_umpire_placeholder():
+    return {"source": "UmpScorecards not directly integrated", "note": "Auto-pull pending custom scraper/API"}
+
+
+def merge_all(schedule_df, odds_df, weather_df):
+    if schedule_df.empty and odds_df.empty:
+        return pd.DataFrame()
+    merged = schedule_df.merge(odds_df, on=["home_team", "away_team"], how="left") if not odds_df.empty else schedule_df.copy()
+    merged = merged.merge(weather_df, on="home_team", how="left") if not weather_df.empty else merged
+    merged["display_time"] = merged["game_datetime_et"].combine_first(merged.get("commence_time_et"))
+    return merged.sort_values("display_time")
+
+
+def recommendation_from_market(over_price, under_price):
+    fair_over, fair_under = no_vig_fair_probs(over_price, under_price)
+    if fair_over is None or fair_under is None:
+        return "PASS"
+    if fair_under > 0.515:
+        return "UNDER"
+    if fair_over > 0.515:
+        return "OVER"
+    return "PASS"
+
+
+def weather_edge(temp_f, wind_mph):
+    adj = 0.0
+    notes = []
+    if temp_f is not None:
+        if temp_f >= 88:
+            adj += 0.15
+            notes.append("Hot weather over lean")
+        elif temp_f <= 50:
+            adj -= 0.15
+            notes.append("Cold weather under lean")
+    if wind_mph is not None:
+        if wind_mph >= 12:
+            notes.append("Meaningful wind; direction review still manual")
+    return adj, "; ".join(notes) if notes else "Weather neutral"
+
+
 st.title("⚾ MLB Totals Bet Tracker")
+st.caption("Auto-pulls schedule, totals odds, weather, team metrics, bullpen proxy, and stores close/CLV fields.")
 
-tab_dash, tab_check, tab_log = st.tabs(["📋 Games (72h)", "✅ Pre-Bet Checklist", "📓 Bet Log"])
+with st.sidebar:
+    st.header("Settings")
+    api_key = st.text_input("Odds API Key", type="password")
+    regions = st.text_input("Odds regions", value="us")
+    bookmakers = st.text_input("Bookmakers (optional)", value="")
+    bankroll = st.number_input("Bankroll ($)", min_value=100.0, value=6500.0, step=100.0)
+    season = st.number_input("Season", min_value=2024, max_value=2026, value=2026, step=1)
+    st.caption("For Streamlit Cloud, move the API key into Secrets later.")
 
-# ════════════════════════════════════════════════════════════════════════════════
-# TAB 1 — 72-hour game dashboard
-# ════════════════════════════════════════════════════════════════════════════════
-with tab_dash:
-    st.subheader("Upcoming Games — Next 72 Hours")
-    if st.button("🔄 Refresh Schedule"):
-        st.cache_data.clear()
-        st.rerun()
+bet_log = load_data()
 
-    games = fetch_games_72h()
-    if not games:
-        st.warning("No upcoming games found or API unavailable.")
-    else:
-        # Group by date
-        from itertools import groupby
-        from operator import itemgetter
+schedule_df = fetch_schedule_72h()
+odds_df = fetch_odds(api_key, regions=regions, bookmakers=bookmakers) if api_key else pd.DataFrame()
+weather_df = fetch_weather_for_games(schedule_df["home_team"].dropna().unique().tolist()) if not schedule_df.empty else pd.DataFrame()
+team_bat, team_pit = fetch_team_metrics(int(season))
+ump_info = fetch_umpire_placeholder()
+merged = merge_all(schedule_df, odds_df, weather_df)
 
-        for date_str, day_games in groupby(games, key=lambda g: g["game_datetime_et"].strftime("%A, %B %-d")):
-            day_list = list(day_games)
-            st.markdown(f"### 📅 {date_str}  —  {len(day_list)} game{'s' if len(day_list)!=1 else ''}")
-            for g in day_list:
-                gk  = game_key(g)
-                log = bet_log.get(gk, {})
-                away = abbrev(g["away_name"])
-                home = abbrev(g["home_name"])
-                dt   = g["game_datetime_et"]
-                away_prob = g.get("away_probable_pitcher","TBD")
-                home_prob = g.get("home_probable_pitcher","TBD")
+if merged.empty:
+    st.warning("No games loaded yet. Add your Odds API key and confirm games are on the board.")
+else:
+    st.subheader("Upcoming games")
+    for _, row in merged.iterrows():
+        dt = row.get("display_time")
+        date_txt = dt.strftime("%Y-%m-%d") if pd.notna(dt) else datetime.now(ET).strftime("%Y-%m-%d")
+        time_txt = dt.strftime("%-I:%M %p ET") if pd.notna(dt) else "TBD"
+        away = row.get("away_team")
+        home = row.get("home_team")
+        away_abbr = team_abbr(away)
+        home_abbr = team_abbr(home)
+        game_key = f"{date_txt}_{away}_{home}"
 
-                market   = log.get("market", "—")
-                stake    = log.get("stake",  "—")
-                price    = log.get("price",  "—")
-                fair     = log.get("fair",   "—")
-                pin_cls  = log.get("pin_close","TBD")
-                clv      = log.get("clv",    "TBD")
-                notes    = log.get("notes",  "")
-                decision = log.get("decision","—")
+        over_price = row.get("over_price")
+        under_price = row.get("under_price")
+        market_total = row.get("market_total")
+        signal = recommendation_from_market(over_price, under_price)
+        fair_over, fair_under = no_vig_fair_probs(over_price, under_price)
+        chosen_prob = fair_under if signal == "UNDER" else fair_over if signal == "OVER" else None
+        chosen_price = under_price if signal == "UNDER" else over_price if signal == "OVER" else None
+        stake = quarter_kelly(bankroll, chosen_prob, chosen_price) if chosen_price else 0.0
 
-                tag_color = "tag-over" if "over" in decision.lower() else \
-                            "tag-under" if "under" in decision.lower() else "tag-pass"
+        home_bat = team_bat[team_bat["Team"] == home_abbr] if not team_bat.empty else pd.DataFrame()
+        away_bat = team_bat[team_bat["Team"] == away_abbr] if not team_bat.empty else pd.DataFrame()
+        home_pit = team_pit[team_pit["Team"] == home_abbr] if not team_pit.empty else pd.DataFrame()
+        away_pit = team_pit[team_pit["Team"] == away_abbr] if not team_pit.empty else pd.DataFrame()
 
-                st.markdown(f"""
-<div class="bet-card">
-  <h4>⚾ {away} @ {home} &nbsp;·&nbsp; {dt.strftime('%-I:%M %p ET')}</h4>
-  <div class="field-label">Probable Pitchers</div>
-  <div class="field-value">✈ {g['away_name']}: <b>{away_prob}</b> &nbsp;·&nbsp; 🏠 {g['home_name']}: <b>{home_prob}</b></div>
-  <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
-    <div><div class="field-label">Market</div><div class="field-value">{market}</div></div>
-    <div><div class="field-label">Stake</div><div class="field-value">{stake}</div></div>
-    <div><div class="field-label">Price</div><div class="field-value">{price}</div></div>
-    <div><div class="field-label">No-Vig Fair</div><div class="field-value">{fair}</div></div>
-  </div>
-  <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
-    <div><div class="field-label">Pinnacle Close</div><div class="field-value">{pin_cls}</div></div>
-    <div><div class="field-label">CLV</div><div class="field-value">{clv}</div></div>
-    <div><div class="field-label">Decision</div><div class="field-value"><span class="{tag_color}">{decision}</span></div></div>
-  </div>
-  {'<div class="field-label">Notes</div><div class="field-value" style="font-style:italic;color:#cba6f7;">' + notes + '</div>' if notes else ''}
-</div>
-""", unsafe_allow_html=True)
+        home_wrc = float(home_bat["wRC+"].iloc[0]) if not home_bat.empty and pd.notna(home_bat["wRC+"].iloc[0]) else None
+        away_wrc = float(away_bat["wRC+"].iloc[0]) if not away_bat.empty and pd.notna(away_bat["wRC+"].iloc[0]) else None
+        home_xera = float(home_pit["xERA"].iloc[0]) if not home_pit.empty and pd.notna(home_pit["xERA"].iloc[0]) else None
+        away_xera = float(away_pit["xERA"].iloc[0]) if not away_pit.empty and pd.notna(away_pit["xERA"].iloc[0]) else None
 
-                with st.expander(f"✏️ Edit bet data — {away} @ {home}"):
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        mkt  = st.text_input("Market (e.g. F5 Under 4.5)", value=log.get("market",""), key=f"mkt_{gk}")
-                        pr   = st.text_input("Price (e.g. -115)", value=log.get("price",""), key=f"pr_{gk}")
-                        fv   = st.text_input("No-vig fair value", value=log.get("fair",""), key=f"fv_{gk}")
-                        dec  = st.selectbox("Decision", ["—","Over","Under","Pass","F5 Over","F5 Under"],
-                                            index=["—","Over","Under","Pass","F5 Over","F5 Under"].index(log.get("decision","—"))
-                                            if log.get("decision","—") in ["—","Over","Under","Pass","F5 Over","F5 Under"] else 0,
-                                            key=f"dec_{gk}")
-                    with c2:
-                        stk  = st.text_input("Stake ($)", value=log.get("stake",""), key=f"stk_{gk}")
-                        pin  = st.text_input("Pinnacle close (post-game)", value=log.get("pin_close",""), key=f"pin_{gk}")
-                        clv_in = st.text_input("CLV (post-game)", value=log.get("clv",""), key=f"clv_{gk}")
-                    nt = st.text_area("Notes", value=log.get("notes",""), height=80, key=f"nt_{gk}",
-                                      placeholder="Bullpen-day trigger, wind, F5 divergence, etc.")
-                    if st.button("💾 Save", key=f"save_{gk}"):
-                        bet_log[gk] = {
-                            "market": mkt, "price": pr, "fair": fv,
-                            "decision": dec, "stake": stk,
-                            "pin_close": pin, "clv": clv_in, "notes": nt,
-                            "game_label": game_label(g),
-                        }
-                        save_data(bet_log)
-                        st.success("Saved!")
-                        st.rerun()
+        home_pen_score, home_pen_note = bullpen_fatigue_score(home_abbr, int(season))
+        away_pen_score, away_pen_note = bullpen_fatigue_score(away_abbr, int(season))
+        wx_adj, wx_note = weather_edge(row.get("temp_f"), row.get("wind_mph"))
 
-# ════════════════════════════════════════════════════════════════════════════════
-# TAB 2 — Pre-Bet Checklist
-# ════════════════════════════════════════════════════════════════════════════════
-with tab_check:
-    st.subheader("Pre-Bet Checklist & Run Adjuster")
-
-    games = fetch_games_72h()
-    if not games:
-        st.warning("No upcoming games found.")
-    else:
-        game_options = {game_label(g): g for g in games}
-        selected_label = st.selectbox("Select Game", list(game_options.keys()))
-        sel_game = game_options[selected_label]
-        gk = game_key(sel_game)
-
-        st.markdown("---")
-
-        # ── Tier 1 ──
-        st.markdown("#### 🔴 Tier 1 — Deal-Breakers")
-        t1_checks = {}
-        for code, question in CHECKLIST_T1:
-            cols = st.columns([0.8, 0.2])
-            with cols[0]:
-                st.markdown(f"<div style='font-size:.85rem;padding:4px 0;'><b>{code}</b> {question}</div>",
-                            unsafe_allow_html=True)
-            with cols[1]:
-                t1_checks[code] = st.checkbox("✓", key=f"t1_{gk}_{code}", label_visibility="collapsed")
-
-        t1_pass = all(t1_checks.values())
-        t1_score = sum(t1_checks.values())
-        if t1_pass:
-            st.markdown("<div class='tier-ok'>✅ Tier 1 CLEAR — proceed to Tier 2</div>", unsafe_allow_html=True)
-        else:
-            fails = [c for c, v in t1_checks.items() if not v]
-            st.markdown(f"<div class='tier-pass'>🚫 Tier 1 FAIL — {len(fails)} red flags: {', '.join(fails)}</div>",
-                        unsafe_allow_html=True)
-
-        st.markdown("---")
-        # ── Tier 2 ──
-        st.markdown("#### 🟡 Tier 2 — Run-Adjustment Factors")
-        t2_checks = {}
-        for code, question in CHECKLIST_T2:
-            cols = st.columns([0.8, 0.2])
-            with cols[0]:
-                st.markdown(f"<div style='font-size:.85rem;padding:4px 0;'><b>{code}</b> {question}</div>",
-                            unsafe_allow_html=True)
-            with cols[1]:
-                t2_checks[code] = st.checkbox("✓", key=f"t2_{gk}_{code}", label_visibility="collapsed")
-        t2_pct = sum(t2_checks.values()) / len(t2_checks) * 100
-        st.markdown(f"<div class='tier-{'ok' if t2_pct>=75 else 'warn'}'>Tier 2: {t2_pct:.0f}% complete</div>",
-                    unsafe_allow_html=True)
-
-        st.markdown("---")
-        # ── Tier 3 ──
-        st.markdown("#### 🟢 Tier 3 — Market & Regression Signals")
-        t3_checks = {}
-        for code, question in CHECKLIST_T3:
-            cols = st.columns([0.8, 0.2])
-            with cols[0]:
-                st.markdown(f"<div style='font-size:.85rem;padding:4px 0;'><b>{code}</b> {question}</div>",
-                            unsafe_allow_html=True)
-            with cols[1]:
-                t3_checks[code] = st.checkbox("✓", key=f"t3_{gk}_{code}", label_visibility="collapsed")
-
-        st.markdown("---")
-        # ── Run Adjuster ──
-        st.markdown("#### 🎯 Run Adjuster — Select Active Factors")
-        base_line = st.number_input("Base Line (e.g. 8.5)", value=8.5, step=0.5, key=f"bl_{gk}")
-        active_factors = []
-        cols_f = st.columns(2)
-        factor_items = list(RUN_ADJ_FACTORS.items())
-        for i, (key, (desc, weight)) in enumerate(factor_items):
-            col = cols_f[i % 2]
-            with col:
-                on = st.checkbox(f"{'▲' if weight>0 else '▼'} {key}: {desc} ({'+' if weight>0 else ''}{weight})",
-                                  key=f"rf_{gk}_{key}")
-                if on:
-                    active_factors.append((key, weight))
-
-        total_adj = sum(w for _, w in active_factors)
-        adj_line  = base_line + total_adj
-        direction = "OVER" if total_adj > 0.15 else ("UNDER" if total_adj < -0.15 else "NEUTRAL")
-        dir_class = "score-pos" if direction=="OVER" else ("score-neg" if direction=="UNDER" else "score-neu")
+        saved = bet_log.get(game_key, {})
+        pinnacle_close = saved.get("pinnacle_close", row.get("pinnacle_under") if signal == "UNDER" else row.get("pinnacle_over"))
+        clv = saved.get("clv", "TBD")
+        tag_class = "tag-under" if signal == "UNDER" else "tag-over" if signal == "OVER" else "tag-pass"
 
         st.markdown(f"""
-<div class="score-box">
-  <div class="field-label">Base Line</div>
-  <div class="field-value">{base_line}</div>
-  <div class="field-label">Total Adjustment</div>
-  <div class="field-value">{'+' if total_adj>=0 else ''}{total_adj:.2f} runs</div>
-  <div class="field-label">Adjusted Fair Line</div>
-  <div class="score-num {dir_class}">{adj_line:.1f}</div>
-  <div class="field-label" style="margin-top:4px;">Signal</div>
-  <div class="field-value"><b>{direction}</b></div>
+<div class="bet-card">
+  <div class="small-label">Date</div><div class="big-value">{date_txt}</div>
+  <div class="small-label" style="margin-top:8px;">Game</div><div class="big-value">{away_abbr} @ {home_abbr} {time_txt}</div>
+  <div class="small-label" style="margin-top:8px;">Probable Pitchers</div><div class="muted">{row.get('away_pitcher','TBD')} vs {row.get('home_pitcher','TBD')}</div>
+  <div class="small-label" style="margin-top:8px;">Market / Signal</div><div class="big-value">Total {market_total if pd.notna(market_total) else '[TBD]'} · <span class="tag {tag_class}">{signal}</span></div>
 </div>
 """, unsafe_allow_html=True)
 
-        st.markdown("---")
-        # ── Kelly Sizer ──
-        st.markdown("#### 💰 Quarter-Kelly Stake Calculator")
-        bk = st.number_input("Bankroll ($)", value=6500.0, step=100.0, key=f"bk_{gk}")
-        edge_input = st.selectbox("Estimated Edge", list(KELLY_TABLE.keys()), index=2, key=f"edge_{gk}")
-        price_input = st.number_input("Bet Price (American odds, e.g. -115)", value=-115, step=5, key=f"odds_{gk}")
-        edge_val = KELLY_TABLE[edge_input]
-        recommended = kelly_stake(bk, edge_val, price_input)
-        st.success(f"Quarter-Kelly Recommended Stake: **${recommended:,.2f}**")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Over", over_price if pd.notna(over_price) else "TBD")
+        c2.metric("Under", under_price if pd.notna(under_price) else "TBD")
+        c3.metric("Pinnacle ref", pinnacle_close if pinnacle_close is not None else "TBD")
+        c4.metric("Stake", f"${stake:,.2f}")
 
-        # ── Bet Card Output ──
-        st.markdown("---")
-        st.markdown("#### 📋 Bet Card Template")
-        away = abbrev(sel_game["away_name"])
-        home = abbrev(sel_game["home_name"])
-        dt_et = sel_game["game_datetime_et"]
-        log = bet_log.get(gk, {})
+        c5, c6, c7 = st.columns(3)
+        c5.metric("Weather", f"{row.get('temp_f')}°F / {row.get('wind_mph')} mph" if pd.notna(row.get('temp_f')) else "TBD")
+        c6.metric("Home wRC+", f"{home_wrc:.1f}" if home_wrc is not None else "TBD")
+        c7.metric("Away wRC+", f"{away_wrc:.1f}" if away_wrc is not None else "TBD")
 
-        card_text = f"""Date: {dt_et.strftime('%Y-%m-%d')}
-Game: {away} @ {home} {dt_et.strftime('%-I:%M %p ET')}
-Market: {log.get('market', 'F5 Under [LINE TBD]')}
-Stake: ${recommended:,.2f} (quarter-Kelly)
-Price: {log.get('price', '[TBD]')}
-No-vig fair: {log.get('fair', 'TBD post-bet')}
-Pinnacle close: {log.get('pin_close', 'TBD (log post-game)')}
-CLV: {log.get('clv', 'TBD')}
-Base line: {base_line} | Adj: {'+' if total_adj>=0 else ''}{total_adj:.2f} → Fair {adj_line:.1f}
-Signal: {direction}
-Active factors: {', '.join([k for k,_ in active_factors]) if active_factors else 'None'}
-Notes: {log.get('notes', '')}
-T1 pass: {'YES' if t1_pass else 'NO — ' + str(sum(1 for v in t1_checks.values() if not v)) + ' flags'}
-T2 complete: {t2_pct:.0f}%"""
+        st.caption(f"Weather note: {wx_note} | Umpire: {ump_info['note']} | Home bullpen: {home_pen_note} | Away bullpen: {away_pen_note}")
+        st.caption(f"Pitching xERA — {away_abbr}: {away_xera if away_xera is not None else 'TBD'} | {home_abbr}: {home_xera if home_xera is not None else 'TBD'}")
 
-        st.code(card_text, language="text")
+        with st.expander(f"Output card — {away_abbr} @ {home_abbr}"):
+            manual_market = st.text_input("Market", value=saved.get("market", f"Total {market_total}" if pd.notna(market_total) else "Total [TBD]"), key=f"market_{game_key}")
+            notes_default = saved.get("notes", wx_note)
+            notes = st.text_area("Notes", value=notes_default, key=f"notes_{game_key}", height=120)
+            pin_input = st.text_input("Pinnacle close", value=str(saved.get("pinnacle_close", pinnacle_close if pinnacle_close is not None else "TBD (post-close)")), key=f"pin_{game_key}")
 
-# ════════════════════════════════════════════════════════════════════════════════
-# TAB 3 — Bet Log
-# ════════════════════════════════════════════════════════════════════════════════
-with tab_log:
-    st.subheader("📓 Bet Log")
-    if not bet_log:
-        st.info("No bets logged yet. Use the Games tab to add bet data.")
-    else:
-        for gk, data in sorted(bet_log.items(), reverse=True):
-            label = data.get("game_label", f"Game {gk}")
-            dec   = data.get("decision", "—")
-            clv   = data.get("clv", "—")
-            notes = data.get("notes", "")
-            tag_color = "tag-over" if "over" in dec.lower() else \
-                        "tag-under" if "under" in dec.lower() else "tag-pass"
+            auto_clv = "TBD"
+            try:
+                open_price = float(chosen_price) if chosen_price is not None else None
+                close_price = float(pin_input)
+                if open_price is not None:
+                    auto_clv = round(close_price - open_price, 2)
+            except Exception:
+                auto_clv = saved.get("clv", "TBD")
+
+            output_card = f"""Date: {date_txt}
+Game: {away_abbr} @ {home_abbr} {time_txt}
+Market: {manual_market}
+Stake: ${stake:,.2f} (quarter-Kelly)
+Price: {chosen_price if chosen_price is not None else 'TBD'}
+No-vig fair: Over {prob_to_american(fair_over) if fair_over is not None else 'TBD'} / Under {prob_to_american(fair_under) if fair_under is not None else 'TBD'}
+Pinnacle close: {pin_input}
+CLV: {auto_clv}
+Weather: {row.get('temp_f') if pd.notna(row.get('temp_f')) else 'TBD'}F, wind {row.get('wind_mph') if pd.notna(row.get('wind_mph')) else 'TBD'} mph
+Umpire: {ump_info['note']}
+Bullpen fatigue: {away_abbr} {away_pen_score if away_pen_score is not None else 'TBD'} / {home_abbr} {home_pen_score if home_pen_score is not None else 'TBD'}
+Lineup quality: {away_abbr} wRC+ {away_wrc if away_wrc is not None else 'TBD'} / {home_abbr} wRC+ {home_wrc if home_wrc is not None else 'TBD'}
+Notes: {notes if notes else '—'}"""
+            st.code(output_card, language="text")
+
+            if st.button("Save", key=f"save_{game_key}"):
+                bet_log[game_key] = {
+                    "date": date_txt,
+                    "game": f"{away_abbr} @ {home_abbr} {time_txt}",
+                    "market": manual_market,
+                    "price": chosen_price if chosen_price is not None else "TBD",
+                    "fair": f"Over {prob_to_american(fair_over) if fair_over is not None else 'TBD'} / Under {prob_to_american(fair_under) if fair_under is not None else 'TBD'}",
+                    "pinnacle_close": pin_input,
+                    "clv": auto_clv,
+                    "notes": notes,
+                    "signal": signal,
+                    "stake": f"${stake:,.2f}",
+                }
+                save_data(bet_log)
+                st.success("Saved")
+
+    if bet_log:
+        st.subheader("Saved bet cards")
+        for _, v in bet_log.items():
+            sig = v.get("signal", "PASS")
+            tag_class = "tag-under" if sig == "UNDER" else "tag-over" if sig == "OVER" else "tag-pass"
             st.markdown(f"""
 <div class="bet-card">
-  <h4>⚾ {label}</h4>
-  <div style="display:flex;gap:12px;flex-wrap:wrap;">
-    <div><div class="field-label">Market</div><div class="field-value">{data.get('market','—')}</div></div>
-    <div><div class="field-label">Price</div><div class="field-value">{data.get('price','—')}</div></div>
-    <div><div class="field-label">Stake</div><div class="field-value">{data.get('stake','—')}</div></div>
-    <div><div class="field-label">Fair</div><div class="field-value">{data.get('fair','—')}</div></div>
-    <div><div class="field-label">CLV</div><div class="field-value">{clv}</div></div>
-    <div><div class="field-label">Decision</div><div class="field-value"><span class="{tag_color}">{dec}</span></div></div>
-  </div>
-  {'<div class="field-label" style="margin-top:6px;">Notes</div><div class="field-value" style="font-style:italic;color:#cba6f7;">' + notes + '</div>' if notes else ''}
+  <div class="small-label">Game</div><div class="big-value">{v.get('date','')} — {v.get('game','')}</div>
+  <div class="small-label" style="margin-top:8px;">Signal</div><div class="big-value"><span class="tag {tag_class}">{sig}</span></div>
+  <div class="small-label" style="margin-top:8px;">Market / Stake</div><div class="muted">{v.get('market','')} | {v.get('stake','')}</div>
+  <div class="small-label" style="margin-top:8px;">Close / CLV</div><div class="muted">{v.get('pinnacle_close','')} | {v.get('clv','')}</div>
+  <div class="small-label" style="margin-top:8px;">Notes</div><div class="muted">{v.get('notes','')}</div>
 </div>
 """, unsafe_allow_html=True)
-
-        if st.button("🗑️ Clear All Bet Log Data"):
-            bet_log.clear()
-            save_data(bet_log)
-            st.success("Cleared.")
-            st.rerun()
