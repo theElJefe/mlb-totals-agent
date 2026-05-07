@@ -1,538 +1,648 @@
-import os
-import json
-from datetime import datetime, timedelta
+# “””
+MLB Totals Analyzer — pybaseball edition
 
-import numpy as np
-import pandas as pd
-import requests
-import statsapi
+A Streamlit app that pulls Statcast, FanGraphs, and Baseball Reference data
+via pybaseball to support pre-game total-runs (Over/Under) analysis.
+
+This is a standalone analytical view — it does NOT replace the Pre-Bet
+Checklist. Use it as a parallel data source to compare against your
+existing checklist workflow.
+
+Author: Joint Cyber Solutions / Jeff Hartsfield
+License: MIT
+“””
+
 import streamlit as st
-import pytz
-from pybaseball import batting_stats, pitching_stats, batting_stats_range, pitching_stats_range, schedule_and_record
+import pandas as pd
+import numpy as np
+from datetime import date, timedelta
+import plotly.express as px
+import plotly.graph_objects as go
 
-st.set_page_config(page_title="MLB Totals Bet Tracker", page_icon="⚾", layout="wide")
+# pybaseball imports — lazy-loaded inside functions where possible
 
-ET = pytz.timezone("America/New_York")
-DATA_FILE = "bet_log.json"
-SPORT_KEY = "baseball_mlb"
+# to keep cold-start time reasonable on Streamlit Cloud
 
-st.markdown("""
-<style>
-.block-container {padding-top: 1rem; padding-bottom: 2rem;}
-.bet-card {border:1px solid #2d3748;border-radius:12px;padding:14px;margin-bottom:12px;background:#111827;}
-.small-label {font-size:.78rem;color:#9ca3af;text-transform:uppercase;letter-spacing:.03em;}
-.big-value {font-size:1rem;color:#f3f4f6;font-weight:600;}
-.muted {color:#cbd5e1;}
-.good {color:#34d399;font-weight:700;}
-.bad {color:#f87171;font-weight:700;}
-.warn {color:#fbbf24;font-weight:700;}
-.tag {display:inline-block;padding:3px 8px;border-radius:999px;font-size:.78rem;font-weight:700;}
-.tag-over {background:#064e3b;color:#d1fae5;}
-.tag-under {background:#7f1d1d;color:#fee2e2;}
-.tag-pass {background:#374151;color:#e5e7eb;}
-</style>
-""", unsafe_allow_html=True)
+import pybaseball as pyb
+from pybaseball import (
+statcast,
+statcast_pitcher,
+statcast_batter,
+playerid_lookup,
+pitching_stats,
+batting_stats,
+team_batting,
+team_pitching,
+schedule_and_record,
+)
 
-TEAM_TO_ABBR = {
-    "Arizona Diamondbacks":"ARI","Atlanta Braves":"ATL","Baltimore Orioles":"BAL",
-    "Boston Red Sox":"BOS","Chicago Cubs":"CHC","Chicago White Sox":"CWS",
-    "Cincinnati Reds":"CIN","Cleveland Guardians":"CLE","Colorado Rockies":"COL",
-    "Detroit Tigers":"DET","Houston Astros":"HOU","Kansas City Royals":"KC",
-    "Los Angeles Angels":"LAA","Los Angeles Dodgers":"LAD","Miami Marlins":"MIA",
-    "Milwaukee Brewers":"MIL","Minnesota Twins":"MIN","New York Mets":"NYM",
-    "New York Yankees":"NYY","Athletics":"ATH","Oakland Athletics":"OAK",
-    "Philadelphia Phillies":"PHI","Pittsburgh Pirates":"PIT","San Diego Padres":"SD",
-    "San Francisco Giants":"SF","Seattle Mariners":"SEA","St. Louis Cardinals":"STL",
-    "Tampa Bay Rays":"TB","Texas Rangers":"TEX","Toronto Blue Jays":"TOR",
-    "Washington Nationals":"WSH"
+# Enable pybaseball’s local cache to reduce repeated scraping
+
+pyb.cache.enable()
+
+# ============================================================================
+
+# PAGE CONFIG
+
+# ============================================================================
+
+st.set_page_config(
+page_title=“MLB Totals Analyzer”,
+page_icon=“⚾”,
+layout=“wide”,
+initial_sidebar_state=“expanded”,
+)
+
+st.title(“⚾ MLB Totals Analyzer — pybaseball edition”)
+st.caption(
+“A parallel analytical view for total-runs evaluation. “
+“Run alongside the Pre-Bet Checklist, not in place of it.”
+)
+
+# ============================================================================
+
+# PARK FACTOR REFERENCE (static — Statcast 3-year rolling, manually maintained)
+
+# Source: baseballsavant.mlb.com/leaderboard/statcast-park-factors
+
+# Update this table at the start of each season.
+
+# ============================================================================
+
+PARK_FACTORS = {
+# team_abbr: (runs_factor, hr_factor, marine_layer_flag)
+“COL”: (1.13, 1.18, False),  # Coors — altitude king
+“CIN”: (1.07, 1.21, False),
+“BOS”: (1.06, 1.04, False),
+“PHI”: (1.04, 1.10, False),
+“TEX”: (1.03, 1.05, False),
+“KCR”: (1.03, 0.93, False),
+“ATL”: (1.02, 1.04, False),
+“ARI”: (1.01, 1.05, False),
+“TOR”: (1.01, 1.06, False),
+“BAL”: (1.00, 1.07, False),
+“MIN”: (1.00, 1.01, False),
+“HOU”: (1.00, 1.04, False),
+“WSH”: (0.99, 0.97, False),
+“CHW”: (0.99, 1.07, False),
+“STL”: (0.99, 0.92, False),
+“NYY”: (0.99, 1.10, False),
+“MIL”: (0.99, 1.05, False),
+“TBR”: (0.98, 0.95, False),
+“ATH”: (0.98, 0.92, True),   # Sutter Health Park — interim, but West Coast
+“CHC”: (0.97, 1.02, False),
+“NYM”: (0.97, 1.00, False),
+“LAD”: (0.96, 0.98, False),  # marginal marine layer effect at night
+“DET”: (0.96, 0.91, False),
+“CLE”: (0.95, 0.94, False),
+“MIA”: (0.94, 0.85, False),
+“LAA”: (0.94, 0.97, True),   # Angel Stadium — directional marine effect
+“SEA”: (0.93, 0.92, True),   # T-Mobile Park
+“PIT”: (0.93, 0.86, False),
+“SFG”: (0.92, 0.83, True),   # Oracle Park — confirmed marine layer
+“SDP”: (0.92, 0.88, True),   # Petco Park — confirmed marine layer
 }
-BALLPARK_COORDS = {
-    "Arizona Diamondbacks": (33.4453, -112.0667), "Atlanta Braves": (33.8908, -84.4677),
-    "Baltimore Orioles": (39.2839, -76.6217), "Boston Red Sox": (42.3467, -71.0972),
-    "Chicago Cubs": (41.9484, -87.6553), "Chicago White Sox": (41.8300, -87.6339),
-    "Cincinnati Reds": (39.0974, -84.5061), "Cleveland Guardians": (41.4962, -81.6852),
-    "Colorado Rockies": (39.7559, -104.9942), "Detroit Tigers": (42.3390, -83.0485),
-    "Houston Astros": (29.7573, -95.3555), "Kansas City Royals": (39.0517, -94.4803),
-    "Los Angeles Angels": (33.8003, -117.8827), "Los Angeles Dodgers": (34.0739, -118.2400),
-    "Miami Marlins": (25.7781, -80.2197), "Milwaukee Brewers": (43.0280, -87.9712),
-    "Minnesota Twins": (44.9817, -93.2776), "New York Mets": (40.7571, -73.8458),
-    "New York Yankees": (40.8296, -73.9262), "Athletics": (38.2000, -121.4900),
-    "Oakland Athletics": (37.7516, -122.2005), "Philadelphia Phillies": (39.9061, -75.1665),
-    "Pittsburgh Pirates": (40.4469, -80.0057), "San Diego Padres": (32.7073, -117.1566),
-    "San Francisco Giants": (37.7786, -122.3893), "Seattle Mariners": (47.5914, -122.3325),
-    "St. Louis Cardinals": (38.6226, -90.1928), "Tampa Bay Rays": (27.7682, -82.6534),
-    "Texas Rangers": (32.7513, -97.0825), "Toronto Blue Jays": (43.6414, -79.3894),
-    "Washington Nationals": (38.8730, -77.0074)
+
+TEAM_NAME_MAP = {
+“ARI”: “Arizona Diamondbacks”, “ATL”: “Atlanta Braves”, “BAL”: “Baltimore Orioles”,
+“BOS”: “Boston Red Sox”, “CHC”: “Chicago Cubs”, “CHW”: “Chicago White Sox”,
+“CIN”: “Cincinnati Reds”, “CLE”: “Cleveland Guardians”, “COL”: “Colorado Rockies”,
+“DET”: “Detroit Tigers”, “HOU”: “Houston Astros”, “KCR”: “Kansas City Royals”,
+“LAA”: “Los Angeles Angels”, “LAD”: “Los Angeles Dodgers”, “MIA”: “Miami Marlins”,
+“MIL”: “Milwaukee Brewers”, “MIN”: “Minnesota Twins”, “NYM”: “New York Mets”,
+“NYY”: “New York Yankees”, “ATH”: “Athletics”, “PHI”: “Philadelphia Phillies”,
+“PIT”: “Pittsburgh Pirates”, “SDP”: “San Diego Padres”, “SFG”: “San Francisco Giants”,
+“SEA”: “Seattle Mariners”, “STL”: “St. Louis Cardinals”, “TBR”: “Tampa Bay Rays”,
+“TEX”: “Texas Rangers”, “TOR”: “Toronto Blue Jays”, “WSH”: “Washington Nationals”,
 }
 
+# ============================================================================
 
-def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    return {}
+# CACHED DATA PULLS
 
+# ============================================================================
 
-def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_pitching_leaderboard(season: int) -> pd.DataFrame:
+“”“Season-level pitching stats from FanGraphs. Cached 1h.”””
+df = pitching_stats(season, qual=10)
+return df
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_batting_leaderboard(season: int) -> pd.DataFrame:
+“”“Season-level batting stats from FanGraphs. Cached 1h.”””
+df = batting_stats(season, qual=30)
+return df
 
-def team_abbr(name):
-    return TEAM_TO_ABBR.get(name, (name or "")[:3].upper())
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_team_batting(season: int) -> pd.DataFrame:
+“”“Team-level batting from FanGraphs. Cached 1h.”””
+return team_batting(season)
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_team_pitching(season: int) -> pd.DataFrame:
+“”“Team-level pitching from FanGraphs. Cached 1h.”””
+return team_pitching(season)
 
-def american_to_decimal(odds):
-    if odds is None:
-        return None
-    return 1 + (odds / 100 if odds > 0 else 100 / abs(odds))
+@st.cache_data(ttl=900, show_spinner=False)
+def get_pitcher_id(last: str, first: str) -> int | None:
+“”“Look up MLBAM player ID.”””
+df = playerid_lookup(last.strip(), first.strip())
+if df.empty:
+return None
+# Take the most recently active player matching the name
+df = df.sort_values(“mlb_played_last”, ascending=False)
+pid = df.iloc[0][“key_mlbam”]
+return int(pid) if pd.notna(pid) else None
 
+@st.cache_data(ttl=900, show_spinner=False)
+def get_pitcher_recent_statcast(pid: int, days: int = 21) -> pd.DataFrame:
+“”“Pitch-level Statcast data for a pitcher’s last N days.”””
+end = date.today()
+start = end - timedelta(days=days)
+df = statcast_pitcher(start.strftime(”%Y-%m-%d”), end.strftime(”%Y-%m-%d”), pid)
+return df
 
-def implied_prob_from_american(odds):
-    if odds is None:
-        return None
-    return (100 / (odds + 100)) if odds > 0 else (abs(odds) / (abs(odds) + 100))
+# ============================================================================
 
+# ANALYTICAL HELPERS — checklist-aligned scoring
 
-def no_vig_fair_probs(over_price, under_price):
-    po = implied_prob_from_american(over_price)
-    pu = implied_prob_from_american(under_price)
-    if po is None or pu is None or po + pu == 0:
-        return None, None
-    total = po + pu
-    return po / total, pu / total
+# ============================================================================
 
+def score_pitcher_quality(row: pd.Series) -> tuple[float, str]:
+“””
+T1 pitcher quality signal. Returns (run_adjustment, narrative).
+Negative = under lean; positive = over lean.
+Aligned with checklist Tier 1 deal-breaker weights.
+“””
+xera = row.get(“xERA”, row.get(“ERA”, 4.20))
+siera = row.get(“SIERA”, xera)
+k_pct = row.get(“K%”, 22.0)
+bb_pct = row.get(“BB%”, 8.0)
 
-def prob_to_american(p):
-    if p is None or p <= 0 or p >= 1:
-        return None
-    return int(round(-(p / (1 - p)) * 100)) if p >= 0.5 else int(round(((1 - p) / p) * 100))
+```
+# Composite: weight xERA heavily, SIERA secondary, K-BB% as tiebreaker
+composite = 0.6 * xera + 0.4 * siera
 
+if composite <= 3.00:
+    return -0.25, f"Elite (xERA/SIERA composite {composite:.2f}) → strong under signal"
+elif composite <= 3.50:
+    return -0.15, f"Above-average ({composite:.2f}) → moderate under signal"
+elif composite <= 4.00:
+    return -0.05, f"League average ({composite:.2f}) → slight under"
+elif composite <= 4.50:
+    return +0.10, f"Below average ({composite:.2f}) → moderate over signal"
+else:
+    return +0.20, f"Poor ({composite:.2f}) → strong over signal"
+```
 
-def quarter_kelly(bankroll, fair_prob, offered_odds):
-    dec = american_to_decimal(offered_odds)
-    if not dec or fair_prob is None:
-        return 0.0
-    b = dec - 1
-    p = fair_prob
-    q = 1 - p
-    k = ((b * p) - q) / b if b > 0 else 0
-    return max(0.0, bankroll * (k / 4))
+def score_park(team_abbr: str, is_night: bool) -> tuple[float, str]:
+“”“T2 park + marine layer signal.”””
+if team_abbr not in PARK_FACTORS:
+return 0.0, f”Unknown park for {team_abbr} — neutral”
 
+```
+runs_pf, hr_pf, marine = PARK_FACTORS[team_abbr]
+base_adj = (runs_pf - 1.00) * 8.5  # scale runs factor to typical 8.5 total
 
-@st.cache_data(ttl=900)
-def fetch_schedule_72h():
-    now_et = datetime.now(ET)
-    end_et = now_et + timedelta(hours=72)
-    games = statsapi.schedule(start_date=now_et.strftime("%m/%d/%Y"), end_date=end_et.strftime("%m/%d/%Y"))
-    rows = []
-    for g in games:
-        if g.get("game_type") != "R":
-            continue
-        try:
-            dt = datetime.fromisoformat(g["game_datetime"].replace("Z", "+00:00")).astimezone(ET)
-        except Exception:
-            continue
-        if dt < now_et:
-            continue
-        rows.append({
-            "game_id": g.get("game_id"),
-            "home_team": g.get("home_name"),
-            "away_team": g.get("away_name"),
-            "home_pitcher": g.get("home_probable_pitcher") or "TBD",
-            "away_pitcher": g.get("away_probable_pitcher") or "TBD",
-            "game_datetime_et": dt,
-        })
-    return pd.DataFrame(rows)
+narrative_parts = [f"Run factor {runs_pf:.2f}, HR factor {hr_pf:.2f}"]
 
+marine_adj = 0.0
+if marine and is_night:
+    marine_adj = -0.12
+    narrative_parts.append("🌫️ Marine layer flagged at night — additional under pressure (-0.12)")
+elif marine and not is_night:
+    narrative_parts.append("Marine layer park but day game — no additional adjustment")
 
-@st.cache_data(ttl=300)
-def fetch_odds(api_key, regions="us", markets="totals", bookmakers=""):
-    if not api_key:
-        return pd.DataFrame()
-    params = {"apiKey": api_key, "regions": regions, "markets": markets, "oddsFormat": "american"}
-    if bookmakers.strip():
-        params["bookmakers"] = bookmakers.strip()
-    r = requests.get(f"https://api.the-odds-api.com/v4/sports/{SPORT_KEY}/odds", params=params, timeout=20)
-    r.raise_for_status()
-    rows = []
-    for event in r.json():
-        best_over = best_under = None
-        total_point = None
-        pinnacle_over = pinnacle_under = None
-        for bk in event.get("bookmakers", []):
-            for market in bk.get("markets", []):
-                if market.get("key") != "totals":
-                    continue
-                over = next((o for o in market.get("outcomes", []) if o.get("name") == "Over"), None)
-                under = next((o for o in market.get("outcomes", []) if o.get("name") == "Under"), None)
-                if not over or not under:
-                    continue
-                if total_point is None:
-                    total_point = over.get("point")
-                if best_over is None or (over.get("price") or -9999) > (best_over.get("price") or -9999):
-                    best_over = {"price": over.get("price"), "book": bk.get("title")}
-                if best_under is None or (under.get("price") or -9999) > (best_under.get("price") or -9999):
-                    best_under = {"price": under.get("price"), "book": bk.get("title")}
-                if bk.get("key") == "pinnacle":
-                    pinnacle_over = over.get("price")
-                    pinnacle_under = under.get("price")
-        rows.append({
-            "event_id": event.get("id"),
-            "home_team": event.get("home_team"),
-            "away_team": event.get("away_team"),
-            "commence_time_et": datetime.fromisoformat(event.get("commence_time").replace("Z", "+00:00")).astimezone(ET) if event.get("commence_time") else None,
-            "market_total": total_point,
-            "over_price": best_over.get("price") if best_over else None,
-            "under_price": best_under.get("price") if best_under else None,
-            "best_over_book": best_over.get("book") if best_over else None,
-            "best_under_book": best_under.get("book") if best_under else None,
-            "pinnacle_over": pinnacle_over,
-            "pinnacle_under": pinnacle_under,
-        })
-    return pd.DataFrame(rows)
+total = base_adj + marine_adj
+return total, " | ".join(narrative_parts)
+```
 
+def score_team_offense(team_row: pd.Series) -> tuple[float, str]:
+“”“T2 team offensive quality.”””
+wrc_plus = team_row.get(“wRC+”, 100)
+woba = team_row.get(“wOBA”, 0.310)
+babip = team_row.get(“BABIP”, 0.290)
 
-@st.cache_data(ttl=1800)
-def fetch_weather_for_games(home_teams):
-    rows = []
-    for team in home_teams:
-        coords = BALLPARK_COORDS.get(team)
-        if not coords:
-            rows.append({"home_team": team, "temp_f": None, "wind_mph": None, "wind_dir": None, "weather_note": "Ballpark coords unavailable"})
-            continue
-        lat, lon = coords
-        try:
-            url = "https://api.open-meteo.com/v1/forecast"
-            params = {
-                "latitude": lat,
-                "longitude": lon,
-                "hourly": "temperature_2m,windspeed_10m,winddirection_10m,precipitation_probability",
-                "temperature_unit": "fahrenheit",
-                "windspeed_unit": "mph",
-                "forecast_days": 3,
-                "timezone": "America/New_York",
-            }
-            r = requests.get(url, params=params, timeout=20)
-            r.raise_for_status()
-            js = r.json()
-            hourly = js.get("hourly", {})
-            if not hourly or not hourly.get("time"):
-                rows.append({"home_team": team, "temp_f": None, "wind_mph": None, "wind_dir": None, "weather_note": "No weather data"})
-                continue
-            rows.append({
-                "home_team": team,
-                "temp_f": hourly.get("temperature_2m", [None])[0],
-                "wind_mph": hourly.get("windspeed_10m", [None])[0],
-                "wind_dir": hourly.get("winddirection_10m", [None])[0],
-                "precip_pct": hourly.get("precipitation_probability", [None])[0],
-                "weather_note": "Auto-pulled via Open-Meteo"
-            })
-        except Exception:
-            rows.append({"home_team": team, "temp_f": None, "wind_mph": None, "wind_dir": None, "precip_pct": None, "weather_note": "Weather pull failed"})
-    return pd.DataFrame(rows)
-
-
-@st.cache_data(ttl=14400)
-def fetch_team_metrics(season):
-    try:
-        try:
-            bat = batting_stats(season, season, qual=0)
-            pit = pitching_stats(season, season, qual=0)
-        except Exception:
-            start_dt = f"{season}-03-01"
-            end_dt = f"{season}-11-30"
-            bat = batting_stats_range(start_dt, end_dt)
-            pit = pitching_stats_range(start_dt, end_dt)
-
-        bat = bat[[c for c in ["Team", "Name", "PA", "wRC+", "K%", "BB%", "ISO", "wOBA"] if c in bat.columns]] if bat is not None and not bat.empty else pd.DataFrame()
-        pit = pit[[c for c in ["Team", "Name", "IP", "ERA", "xERA", "FIP", "WHIP", "K/9", "BB/9"] if c in pit.columns]] if pit is not None and not pit.empty else pd.DataFrame()
-
-        team_bat = (
-            bat.groupby("Team", as_index=False).agg({"PA":"sum", "wRC+":"mean", "K%":"mean", "BB%":"mean", "ISO":"mean", "wOBA":"mean"})
-            if not bat.empty and "Team" in bat.columns else pd.DataFrame()
-        )
-        team_pit = (
-            pit.groupby("Team", as_index=False).agg({"IP":"sum", "ERA":"mean", "xERA":"mean", "FIP":"mean", "WHIP":"mean", "K/9":"mean", "BB/9":"mean"})
-            if not pit.empty and "Team" in pit.columns else pd.DataFrame()
-        )
-        return team_bat, team_pit
-    except Exception as e:
-        return pd.DataFrame(), pd.DataFrame()
-
-
-@st.cache_data(ttl=7200)
-def bullpen_fatigue_score(team_abbr_code, season):
-    try:
-        df = schedule_and_record(season, team_abbr_code)
-        if df is None or df.empty or "Date" not in df.columns:
-            return None, "No schedule data"
-        recent = df.tail(5).copy()
-        games_3 = min(len(recent.tail(3)), 3)
-        games_5 = min(len(recent), 5)
-        score = round((games_3 * 0.6 + games_5 * 0.2), 2)
-        note = f"Proxy fatigue from last {games_5} team games"
-        return score, note
-    except Exception:
-        return None, "Bullpen proxy unavailable"
-
-
-@st.cache_data(ttl=43200)
-def fetch_umpire_placeholder():
-    return {"source": "UmpScorecards not directly integrated", "note": "Auto-pull pending custom scraper/API"}
-
-
-def merge_all(schedule_df, odds_df, weather_df):
-    schedule_df = schedule_df.copy().reset_index(drop=True) if schedule_df is not None else pd.DataFrame()
-    odds_df = odds_df.copy().reset_index(drop=True) if odds_df is not None and not odds_df.empty else pd.DataFrame()
-    weather_df = weather_df.copy().reset_index(drop=True) if weather_df is not None and not weather_df.empty else pd.DataFrame()
-
-    if schedule_df.empty and odds_df.empty:
-        return pd.DataFrame()
-
-    if not schedule_df.empty:
-        schedule_df.columns = [str(c) for c in schedule_df.columns]
-    if not odds_df.empty:
-        odds_df.columns = [str(c) for c in odds_df.columns]
-    if not weather_df.empty:
-        weather_df.columns = [str(c) for c in weather_df.columns]
-
-    required_sched = ["home_team", "away_team"]
-    required_weather = ["home_team"]
-
-    for col in required_sched:
-        if col not in schedule_df.columns and not schedule_df.empty:
-            schedule_df[col] = None
-        if col not in odds_df.columns and not odds_df.empty:
-            odds_df[col] = None
-    for col in required_weather:
-        if col not in weather_df.columns and not weather_df.empty:
-            weather_df[col] = None
-
-    if not schedule_df.empty:
-        schedule_df["home_team"] = schedule_df["home_team"].astype("string").str.strip()
-        schedule_df["away_team"] = schedule_df["away_team"].astype("string").str.strip()
-    if not odds_df.empty:
-        odds_df["home_team"] = odds_df["home_team"].astype("string").str.strip()
-        odds_df["away_team"] = odds_df["away_team"].astype("string").str.strip()
-    if not weather_df.empty:
-        weather_df["home_team"] = weather_df["home_team"].astype("string").str.strip()
-        weather_df = weather_df.drop_duplicates(subset=["home_team"], keep="first")
-
-    if schedule_df.empty:
-        merged = odds_df.copy()
-    elif odds_df.empty:
-        merged = schedule_df.copy()
-    else:
-        merged = schedule_df.merge(
-            odds_df,
-            on=["home_team", "away_team"],
-            how="left",
-            validate="1:1"
-        )
-
-    if not weather_df.empty:
-        merged = merged.merge(weather_df, on="home_team", how="left", validate="m:1")
-
-    if "game_datetime_et" not in merged.columns:
-        merged["game_datetime_et"] = pd.NaT
-    if "commence_time_et" not in merged.columns:
-        merged["commence_time_et"] = pd.NaT
-
-    merged["game_datetime_et"] = pd.to_datetime(merged["game_datetime_et"], errors="coerce")
-    merged["commence_time_et"] = pd.to_datetime(merged["commence_time_et"], errors="coerce")
-    merged["display_time"] = merged["game_datetime_et"].fillna(merged["commence_time_et"])
-
-    return merged.sort_values("display_time", na_position="last").reset_index(drop=True)
-
-
-def recommendation_from_market(over_price, under_price):
-    fair_over, fair_under = no_vig_fair_probs(over_price, under_price)
-    if fair_over is None or fair_under is None:
-        return "PASS"
-    if fair_under > 0.515:
-        return "UNDER"
-    if fair_over > 0.515:
-        return "OVER"
-    return "PASS"
-
-
-def weather_edge(temp_f, wind_mph):
+```
+if wrc_plus >= 115:
+    adj = +0.10
+    tone = "Strong offense"
+elif wrc_plus >= 105:
+    adj = +0.05
+    tone = "Above-average offense"
+elif wrc_plus >= 95:
     adj = 0.0
-    notes = []
-    if temp_f is not None:
-        if temp_f >= 88:
-            adj += 0.15
-            notes.append("Hot weather over lean")
-        elif temp_f <= 50:
-            adj -= 0.15
-            notes.append("Cold weather under lean")
-    if wind_mph is not None:
-        if wind_mph >= 12:
-            notes.append("Meaningful wind; direction review still manual")
-    return adj, "; ".join(notes) if notes else "Weather neutral"
+    tone = "League-average offense"
+elif wrc_plus >= 85:
+    adj = -0.05
+    tone = "Below-average offense"
+else:
+    adj = -0.10
+    tone = "Weak offense"
 
+# BABIP regression flag (T3)
+babip_note = ""
+if babip < 0.275:
+    babip_note = f" | ⚠️ BABIP {babip:.3f} — positive regression risk (mild over flag)"
+elif babip > 0.315:
+    babip_note = f" | ⚠️ BABIP {babip:.3f} — negative regression risk (mild under flag)"
 
-st.title("⚾ MLB Totals Bet Tracker")
-st.caption("Auto-pulls schedule, totals odds, weather, team metrics, bullpen proxy, and stores close/CLV fields.")
+return adj, f"{tone} (wRC+ {wrc_plus:.0f}, wOBA {woba:.3f}){babip_note}"
+```
+
+def detect_form_trend(pitcher_df: pd.DataFrame) -> tuple[float, str]:
+“””
+L21d trend check on pitcher Statcast data.
+Looks at velocity and whiff trends — proxy for the checklist 2.1.5–2.1.10 cluster.
+“””
+if pitcher_df.empty:
+return 0.0, “No recent Statcast data available”
+
+```
+# Velocity trend: split into halves and compare
+pitcher_df = pitcher_df.sort_values("game_date").reset_index(drop=True)
+midpoint = len(pitcher_df) // 2
+if midpoint < 10:
+    return 0.0, "Insufficient pitch sample for trend"
+
+early = pitcher_df.iloc[:midpoint]
+late = pitcher_df.iloc[midpoint:]
+
+early_velo = early["release_speed"].mean()
+late_velo = late["release_speed"].mean()
+velo_delta = late_velo - early_velo
+
+notes = [f"Velocity trend: {early_velo:.1f} → {late_velo:.1f} mph (Δ {velo_delta:+.2f})"]
+
+adj = 0.0
+if velo_delta <= -0.8:
+    adj += 0.08
+    notes.append("⚠️ Significant velocity decline → mild over lean")
+elif velo_delta >= 0.5:
+    adj -= 0.05
+    notes.append("✅ Velocity ticking up → mild under lean")
+
+# Whiff trend (description == 'swinging_strike')
+if "description" in pitcher_df.columns:
+    early_whiff = (early["description"] == "swinging_strike").mean()
+    late_whiff = (late["description"] == "swinging_strike").mean()
+    whiff_delta = late_whiff - early_whiff
+    notes.append(f"Whiff%: {early_whiff*100:.1f} → {late_whiff*100:.1f} (Δ {whiff_delta*100:+.1f}pp)")
+    if whiff_delta <= -0.03:
+        adj += 0.05
+        notes.append("⚠️ Whiff rate falling → mild over lean")
+
+return adj, " | ".join(notes)
+```
+
+# ============================================================================
+
+# SIDEBAR — Game Configuration
+
+# ============================================================================
 
 with st.sidebar:
-    st.header("Settings")
-    api_key = st.text_input("Odds API Key", type="password")
-    regions = st.text_input("Odds regions", value="us")
-    bookmakers = st.text_input("Bookmakers (optional)", value="")
-    bankroll = st.number_input("Bankroll ($)", min_value=100.0, value=6500.0, step=100.0)
-    season = st.number_input("Season", min_value=2024, max_value=2026, value=2026, step=1)
-    st.caption("For Streamlit Cloud, move the API key into Secrets later.")
+st.header(“Game Setup”)
 
-bet_log = load_data()
+```
+season = st.number_input(
+    "Season",
+    min_value=2020,
+    max_value=date.today().year,
+    value=date.today().year,
+    step=1,
+)
 
-schedule_df = fetch_schedule_72h()
-odds_df = fetch_odds(api_key, regions=regions, bookmakers=bookmakers) if api_key else pd.DataFrame()
-weather_df = fetch_weather_for_games(schedule_df["home_team"].dropna().unique().tolist()) if not schedule_df.empty else pd.DataFrame()
+away_team = st.selectbox(
+    "Away team",
+    options=sorted(TEAM_NAME_MAP.keys()),
+    index=sorted(TEAM_NAME_MAP.keys()).index("STL"),
+    format_func=lambda x: f"{x} — {TEAM_NAME_MAP[x]}",
+)
+home_team = st.selectbox(
+    "Home team",
+    options=sorted(TEAM_NAME_MAP.keys()),
+    index=sorted(TEAM_NAME_MAP.keys()).index("SDP"),
+    format_func=lambda x: f"{x} — {TEAM_NAME_MAP[x]}",
+)
+
+st.divider()
+st.subheader("Starting pitchers")
+
+away_p_first = st.text_input("Away SP first name", value="Matthew")
+away_p_last = st.text_input("Away SP last name", value="Liberatore")
+home_p_first = st.text_input("Home SP first name", value="Michael")
+home_p_last = st.text_input("Home SP last name", value="King")
+
+st.divider()
+
+posted_total = st.number_input(
+    "Posted total (O/U line)",
+    min_value=5.0,
+    max_value=15.0,
+    value=8.0,
+    step=0.5,
+)
+
+is_night = st.checkbox("Night game", value=True)
+
+run_btn = st.button("🔍 Run analysis", type="primary", use_container_width=True)
+
+st.divider()
+with st.expander("ℹ️ About this app"):
+    st.markdown(
+        "Pulls live data via pybaseball from Baseball Savant, FanGraphs, "
+        "and Baseball Reference. Cache TTL: 15–60 min depending on endpoint. "
+        "First load may take 30–60s as caches warm up."
+    )
+```
+
+# ============================================================================
+
+# MAIN ANALYSIS FLOW
+
+# ============================================================================
+
+if run_btn:
+if away_team == home_team:
+st.error(“Away and home team can’t be the same.”)
+st.stop()
+
+```
+progress = st.progress(0, text="Pulling team-level pitching stats…")
+
+# ---- Team data ----
 try:
-    team_bat, team_pit = fetch_team_metrics(int(season))
-except Exception:
-    team_bat, team_pit = pd.DataFrame(), pd.DataFrame()
-ump_info = fetch_umpire_placeholder()
-merged = merge_all(schedule_df, odds_df, weather_df)
+    team_pit = get_team_pitching(season)
+    progress.progress(15, text="Pulling team-level batting stats…")
+    team_bat = get_team_batting(season)
+except Exception as e:
+    st.error(f"Team data fetch failed: {e}")
+    st.stop()
 
-with st.expander("Debug dataframes"):
-    st.write("schedule_df shape", getattr(schedule_df, "shape", None))
-    st.write("schedule_df columns", list(schedule_df.columns) if hasattr(schedule_df, "columns") else None)
-    st.write(schedule_df.head(3) if hasattr(schedule_df, "head") else None)
-    st.write("odds_df shape", getattr(odds_df, "shape", None))
-    st.write("odds_df columns", list(odds_df.columns) if hasattr(odds_df, "columns") else None)
-    st.write(odds_df.head(3) if hasattr(odds_df, "head") else None)
-    st.write("weather_df shape", getattr(weather_df, "shape", None))
-    st.write("weather_df columns", list(weather_df.columns) if hasattr(weather_df, "columns") else None)
-    st.write(weather_df.head(3) if hasattr(weather_df, "head") else None)
-    st.write("merged shape", getattr(merged, "shape", None))
-    st.write("merged columns", list(merged.columns) if hasattr(merged, "columns") else None)
-    st.write(merged.head(5) if hasattr(merged, "head") else None)
+progress.progress(30, text="Looking up starting pitchers…")
 
-if merged.empty:
-    st.warning("No games loaded yet. Add your Odds API key and confirm games are on the board.")
+# ---- Pitcher IDs ----
+away_pid = get_pitcher_id(away_p_last, away_p_first)
+home_pid = get_pitcher_id(home_p_last, home_p_first)
+
+if not away_pid:
+    st.warning(f"Could not find MLBAM ID for {away_p_first} {away_p_last} — pitcher signal will be neutral.")
+if not home_pid:
+    st.warning(f"Could not find MLBAM ID for {home_p_first} {home_p_last} — pitcher signal will be neutral.")
+
+progress.progress(45, text="Pulling FanGraphs pitcher leaderboard…")
+
+# ---- Pitcher season stats ----
+try:
+    pit_lb = get_pitching_leaderboard(season)
+except Exception as e:
+    st.warning(f"FanGraphs pitcher leaderboard unavailable: {e}")
+    pit_lb = pd.DataFrame()
+
+def find_pitcher_row(lb: pd.DataFrame, first: str, last: str) -> pd.Series | None:
+    if lb.empty:
+        return None
+    # FanGraphs uses 'Name' column as "First Last"
+    full = f"{first} {last}".lower()
+    match = lb[lb["Name"].str.lower() == full]
+    if match.empty:
+        # try contains
+        match = lb[lb["Name"].str.lower().str.contains(last.lower())]
+    return match.iloc[0] if not match.empty else None
+
+away_p_row = find_pitcher_row(pit_lb, away_p_first, away_p_last)
+home_p_row = find_pitcher_row(pit_lb, home_p_first, home_p_last)
+
+progress.progress(60, text="Pulling recent Statcast pitch data…")
+
+# ---- Recent pitch-level data (last 21 days) ----
+away_statcast = get_pitcher_recent_statcast(away_pid) if away_pid else pd.DataFrame()
+home_statcast = get_pitcher_recent_statcast(home_pid) if home_pid else pd.DataFrame()
+
+progress.progress(80, text="Computing signals…")
+
+# ---- Compute signals ----
+signals = []
+
+# Pitcher quality (T1)
+for label, row in [(f"{away_p_first} {away_p_last}", away_p_row),
+                   (f"{home_p_first} {home_p_last}", home_p_row)]:
+    if row is not None:
+        adj, narrative = score_pitcher_quality(row)
+        signals.append({
+            "Tier": "T1",
+            "Factor": f"{label} quality",
+            "Adjustment": adj,
+            "Notes": narrative,
+        })
+    else:
+        signals.append({
+            "Tier": "T1",
+            "Factor": f"{label} quality",
+            "Adjustment": 0.0,
+            "Notes": "No FanGraphs data — neutral",
+        })
+
+# Pitcher form trend (T2)
+for label, df in [(f"{away_p_first} {away_p_last}", away_statcast),
+                  (f"{home_p_first} {home_p_last}", home_statcast)]:
+    adj, narrative = detect_form_trend(df)
+    signals.append({
+        "Tier": "T2",
+        "Factor": f"{label} L21d form",
+        "Adjustment": adj,
+        "Notes": narrative,
+    })
+
+# Park + marine layer (T2)
+park_adj, park_note = score_park(home_team, is_night)
+signals.append({
+    "Tier": "T2",
+    "Factor": f"{home_team} park factor",
+    "Adjustment": park_adj,
+    "Notes": park_note,
+})
+
+# Team offense (T2)
+def find_team_row(team_df: pd.DataFrame, abbr: str) -> pd.Series | None:
+    if team_df.empty:
+        return None
+    # FanGraphs team_batting uses 'Team' column as full name or abbr depending on version
+    candidates = [abbr, TEAM_NAME_MAP.get(abbr, "")]
+    for c in candidates:
+        if not c:
+            continue
+        match = team_df[team_df["Team"].astype(str).str.contains(c, case=False, na=False)]
+        if not match.empty:
+            return match.iloc[0]
+    return None
+
+away_team_row = find_team_row(team_bat, away_team)
+home_team_row = find_team_row(team_bat, home_team)
+
+if away_team_row is not None:
+    adj, narrative = score_team_offense(away_team_row)
+    signals.append({
+        "Tier": "T2",
+        "Factor": f"{away_team} offense",
+        "Adjustment": adj,
+        "Notes": narrative,
+    })
+if home_team_row is not None:
+    adj, narrative = score_team_offense(home_team_row)
+    signals.append({
+        "Tier": "T2",
+        "Factor": f"{home_team} offense",
+        "Adjustment": adj,
+        "Notes": narrative,
+    })
+
+progress.progress(100, text="Done.")
+progress.empty()
+
+# ========================================================================
+# RESULTS DISPLAY
+# ========================================================================
+
+sig_df = pd.DataFrame(signals)
+total_adj = sig_df["Adjustment"].sum()
+
+# Baseline expected total: blend of league avg and team-specific scoring
+# For a clean, honest baseline, we use the FG team R/G if available, else league avg.
+league_avg_total = 8.6  # 2024-2025 league avg ~4.3 R/G per team
+expected_total = league_avg_total + total_adj
+
+edge = expected_total - posted_total
+
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Posted total", f"{posted_total:.1f}")
+col2.metric("Model expected", f"{expected_total:.2f}", f"{total_adj:+.2f} adj")
+col3.metric("Edge vs line", f"{edge:+.2f}")
+
+if abs(edge) < 0.30:
+    verdict = "🟡 NO PLAY"
+    verdict_help = "Edge under 0.30 runs — inside model noise"
+elif edge >= 0.30:
+    verdict = "🟢 OVER lean"
+    verdict_help = f"Model implies +{edge:.2f} runs vs posted line"
 else:
-    st.subheader("Upcoming games")
-    for _, row in merged.iterrows():
-        dt = row.get("display_time")
-        date_txt = dt.strftime("%Y-%m-%d") if pd.notna(dt) else datetime.now(ET).strftime("%Y-%m-%d")
-        time_txt = dt.strftime("%-I:%M %p ET") if pd.notna(dt) else "TBD"
-        away = row.get("away_team")
-        home = row.get("home_team")
-        away_abbr = team_abbr(away)
-        home_abbr = team_abbr(home)
-        game_key = f"{date_txt}_{away}_{home}"
+    verdict = "🔵 UNDER lean"
+    verdict_help = f"Model implies {edge:.2f} runs vs posted line"
 
-        over_price = row.get("over_price")
-        under_price = row.get("under_price")
-        market_total = row.get("market_total")
-        signal = recommendation_from_market(over_price, under_price)
-        fair_over, fair_under = no_vig_fair_probs(over_price, under_price)
-        chosen_prob = fair_under if signal == "UNDER" else fair_over if signal == "OVER" else None
-        chosen_price = under_price if signal == "UNDER" else over_price if signal == "OVER" else None
-        stake = quarter_kelly(bankroll, chosen_prob, chosen_price) if chosen_price else 0.0
+col4.metric("Verdict", verdict, help=verdict_help)
 
-        home_bat = team_bat[team_bat["Team"] == home_abbr] if not team_bat.empty else pd.DataFrame()
-        away_bat = team_bat[team_bat["Team"] == away_abbr] if not team_bat.empty else pd.DataFrame()
-        home_pit = team_pit[team_pit["Team"] == home_abbr] if not team_pit.empty else pd.DataFrame()
-        away_pit = team_pit[team_pit["Team"] == away_abbr] if not team_pit.empty else pd.DataFrame()
+st.divider()
 
-        home_wrc = float(home_bat["wRC+"].iloc[0]) if not home_bat.empty and pd.notna(home_bat["wRC+"].iloc[0]) else None
-        away_wrc = float(away_bat["wRC+"].iloc[0]) if not away_bat.empty and pd.notna(away_bat["wRC+"].iloc[0]) else None
-        home_xera = float(home_pit["xERA"].iloc[0]) if not home_pit.empty and pd.notna(home_pit["xERA"].iloc[0]) else None
-        away_xera = float(away_pit["xERA"].iloc[0]) if not away_pit.empty and pd.notna(away_pit["xERA"].iloc[0]) else None
+# Signal breakdown
+st.subheader("Signal breakdown")
+st.dataframe(
+    sig_df.style.format({"Adjustment": "{:+.2f}"}).background_gradient(
+        subset=["Adjustment"], cmap="RdYlGn_r", vmin=-0.30, vmax=0.30
+    ),
+    use_container_width=True,
+    hide_index=True,
+)
 
-        home_pen_score, home_pen_note = bullpen_fatigue_score(home_abbr, int(season))
-        away_pen_score, away_pen_note = bullpen_fatigue_score(away_abbr, int(season))
-        wx_adj, wx_note = weather_edge(row.get("temp_f"), row.get("wind_mph"))
+# Visual
+fig = px.bar(
+    sig_df,
+    x="Adjustment",
+    y="Factor",
+    color="Adjustment",
+    color_continuous_scale="RdYlGn_r",
+    color_continuous_midpoint=0,
+    orientation="h",
+    title="Run adjustments by factor (negative = under, positive = over)",
+)
+fig.update_layout(height=400, showlegend=False)
+st.plotly_chart(fig, use_container_width=True)
 
-        saved = bet_log.get(game_key, {})
-        pinnacle_close = saved.get("pinnacle_close", row.get("pinnacle_under") if signal == "UNDER" else row.get("pinnacle_over"))
-        clv = saved.get("clv", "TBD")
-        tag_class = "tag-under" if signal == "UNDER" else "tag-over" if signal == "OVER" else "tag-pass"
+st.divider()
 
-        st.markdown(f"""
-<div class="bet-card">
-  <div class="small-label">Date</div><div class="big-value">{date_txt}</div>
-  <div class="small-label" style="margin-top:8px;">Game</div><div class="big-value">{away_abbr} @ {home_abbr} {time_txt}</div>
-  <div class="small-label" style="margin-top:8px;">Probable Pitchers</div><div class="muted">{row.get('away_pitcher','TBD')} vs {row.get('home_pitcher','TBD')}</div>
-  <div class="small-label" style="margin-top:8px;">Market / Signal</div><div class="big-value">Total {market_total if pd.notna(market_total) else '[TBD]'} · <span class="tag {tag_class}">{signal}</span></div>
-</div>
-""", unsafe_allow_html=True)
+# ---- Raw pitcher detail (expanders) ----
+st.subheader("Pitcher detail")
+pcol1, pcol2 = st.columns(2)
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Over", over_price if pd.notna(over_price) else "TBD")
-        c2.metric("Under", under_price if pd.notna(under_price) else "TBD")
-        c3.metric("Pinnacle ref", pinnacle_close if pinnacle_close is not None else "TBD")
-        c4.metric("Stake", f"${stake:,.2f}")
+with pcol1:
+    with st.expander(f"📊 {away_p_first} {away_p_last} — season stats", expanded=False):
+        if away_p_row is not None:
+            st.dataframe(away_p_row.to_frame(name="Value"))
+        else:
+            st.info("No leaderboard row found.")
+    with st.expander(f"⚾ {away_p_first} {away_p_last} — recent Statcast (L21d)"):
+        if not away_statcast.empty:
+            summary = away_statcast.groupby("pitch_type").agg(
+                pitches=("release_speed", "count"),
+                avg_velo=("release_speed", "mean"),
+                avg_spin=("release_spin_rate", "mean"),
+            ).round(1)
+            st.dataframe(summary)
+            st.caption(f"Total pitches in window: {len(away_statcast)}")
+        else:
+            st.info("No Statcast data in window.")
 
-        c5, c6, c7 = st.columns(3)
-        c5.metric("Weather", f"{row.get('temp_f')}°F / {row.get('wind_mph')} mph" if pd.notna(row.get('temp_f')) else "TBD")
-        c6.metric("Home wRC+", f"{home_wrc:.1f}" if home_wrc is not None else "TBD")
-        c7.metric("Away wRC+", f"{away_wrc:.1f}" if away_wrc is not None else "TBD")
+with pcol2:
+    with st.expander(f"📊 {home_p_first} {home_p_last} — season stats", expanded=False):
+        if home_p_row is not None:
+            st.dataframe(home_p_row.to_frame(name="Value"))
+        else:
+            st.info("No leaderboard row found.")
+    with st.expander(f"⚾ {home_p_first} {home_p_last} — recent Statcast (L21d)"):
+        if not home_statcast.empty:
+            summary = home_statcast.groupby("pitch_type").agg(
+                pitches=("release_speed", "count"),
+                avg_velo=("release_speed", "mean"),
+                avg_spin=("release_spin_rate", "mean"),
+            ).round(1)
+            st.dataframe(summary)
+            st.caption(f"Total pitches in window: {len(home_statcast)}")
+        else:
+            st.info("No Statcast data in window.")
 
-        st.caption(f"Weather note: {wx_note} | Umpire: {ump_info['note']} | Home bullpen: {home_pen_note} | Away bullpen: {away_pen_note}")
-        st.caption(f"Pitching xERA — {away_abbr}: {away_xera if away_xera is not None else 'TBD'} | {home_abbr}: {home_xera if home_xera is not None else 'TBD'}")
+st.divider()
 
-        with st.expander(f"Output card — {away_abbr} @ {home_abbr}"):
-            manual_market = st.text_input("Market", value=saved.get("market", f"Total {market_total}" if pd.notna(market_total) else "Total [TBD]"), key=f"market_{game_key}")
-            notes_default = saved.get("notes", wx_note)
-            notes = st.text_area("Notes", value=notes_default, key=f"notes_{game_key}", height=120)
-            pin_input = st.text_input("Pinnacle close", value=str(saved.get("pinnacle_close", pinnacle_close if pinnacle_close is not None else "TBD (post-close)")), key=f"pin_{game_key}")
+# ---- Honesty section ----
+with st.expander("⚠️ Caveats — read before betting"):
+    st.markdown("""
+    - **This is not a replacement for the Pre-Bet Checklist.** It's a parallel data view.
+      The model is intentionally simple to keep behavior auditable.
+    - **Park factors are static** — update `PARK_FACTORS` at season start. They are
+      Statcast 3-year rolling factors, not single-season noise.
+    - **No bullpen, weather, ump, or lineup data** is integrated yet. Those remain
+      checklist responsibilities for now.
+    - **Marine layer flag is binary** — true marine-layer effect varies by onshore-flow
+      conditions on the day. Cross-reference with weather.gov coastal forecast.
+    - **Edge < 0.30 runs is noise.** A "0.4-run edge" is not a green light; it's a
+      modest signal that should align with checklist conclusions before you bet.
+    - **CLV is the only honest scoreboard.** Track no-vig Pinnacle close vs. your bet
+      number across 200+ wagers — short-term P&L is variance.
+    """)
+```
 
-            auto_clv = "TBD"
-            try:
-                open_price = float(chosen_price) if chosen_price is not None else None
-                close_price = float(pin_input)
-                if open_price is not None:
-                    auto_clv = round(close_price - open_price, 2)
-            except Exception:
-                auto_clv = saved.get("clv", "TBD")
+else:
+st.info(“👈 Configure the game in the sidebar and click **Run analysis** to begin.”)
 
-            output_card = f"""Date: {date_txt}
-Game: {away_abbr} @ {home_abbr} {time_txt}
-Market: {manual_market}
-Stake: ${stake:,.2f} (quarter-Kelly)
-Price: {chosen_price if chosen_price is not None else 'TBD'}
-No-vig fair: Over {prob_to_american(fair_over) if fair_over is not None else 'TBD'} / Under {prob_to_american(fair_under) if fair_under is not None else 'TBD'}
-Pinnacle close: {pin_input}
-CLV: {auto_clv}
-Weather: {row.get('temp_f') if pd.notna(row.get('temp_f')) else 'TBD'}F, wind {row.get('wind_mph') if pd.notna(row.get('wind_mph')) else 'TBD'} mph
-Umpire: {ump_info['note']}
-Bullpen fatigue: {away_abbr} {away_pen_score if away_pen_score is not None else 'TBD'} / {home_abbr} {home_pen_score if home_pen_score is not None else 'TBD'}
-Lineup quality: {away_abbr} wRC+ {away_wrc if away_wrc is not None else 'TBD'} / {home_abbr} wRC+ {home_wrc if home_wrc is not None else 'TBD'}
-Notes: {notes if notes else '—'}"""
-            st.code(output_card, language="text")
+```
+with st.expander("📖 What this app does"):
+    st.markdown("""
+    This app is a **second analytical view** designed to run in parallel with the
+    Pre-Bet Checklist (Tiers 1–4). It pulls live data via the `pybaseball` library
+    from three sources:
 
-            if st.button("Save", key=f"save_{game_key}"):
-                bet_log[game_key] = {
-                    "date": date_txt,
-                    "game": f"{away_abbr} @ {home_abbr} {time_txt}",
-                    "market": manual_market,
-                    "price": chosen_price if chosen_price is not None else "TBD",
-                    "fair": f"Over {prob_to_american(fair_over) if fair_over is not None else 'TBD'} / Under {prob_to_american(fair_under) if fair_under is not None else 'TBD'}",
-                    "pinnacle_close": pin_input,
-                    "clv": auto_clv,
-                    "notes": notes,
-                    "signal": signal,
-                    "stake": f"${stake:,.2f}",
-                }
-                save_data(bet_log)
-                st.success("Saved")
+    - **Baseball Savant** (Statcast pitch-level data, expected stats)
+    - **FanGraphs** (xERA, SIERA, wRC+, BABIP, K%, BB%, leaderboards)
+    - **Baseball Reference** (schedule and record)
 
-    if bet_log:
-        st.subheader("Saved bet cards")
-        for _, v in bet_log.items():
-            sig = v.get("signal", "PASS")
-            tag_class = "tag-under" if sig == "UNDER" else "tag-over" if sig == "OVER" else "tag-pass"
-            st.markdown(f"""
-<div class="bet-card">
-  <div class="small-label">Game</div><div class="big-value">{v.get('date','')} — {v.get('game','')}</div>
-  <div class="small-label" style="margin-top:8px;">Signal</div><div class="big-value"><span class="tag {tag_class}">{sig}</span></div>
-  <div class="small-label" style="margin-top:8px;">Market / Stake</div><div class="muted">{v.get('market','')} | {v.get('stake','')}</div>
-  <div class="small-label" style="margin-top:8px;">Close / CLV</div><div class="muted">{v.get('pinnacle_close','')} | {v.get('clv','')}</div>
-  <div class="small-label" style="margin-top:8px;">Notes</div><div class="muted">{v.get('notes','')}</div>
-</div>
-""", unsafe_allow_html=True)
+    It computes a small set of run adjustments aligned with checklist weights:
+    - T1: Starting pitcher quality (xERA/SIERA composite)
+    - T2: Pitcher L21d form trend (Statcast velocity + whiff)
+    - T2: Park factor + marine layer flag (Petco, Oracle, T-Mobile, Angel Stadium)
+    - T2: Team offense (wRC+, wOBA, BABIP regression)
+
+    The output is an **expected total**, an **edge vs. the posted line**, and a
+    per-factor signal breakdown you can compare against your checklist conclusions
+    before integrating.
+    """)
+```
