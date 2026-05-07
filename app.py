@@ -9,33 +9,21 @@ from scipy.stats import norm
 st.set_page_config(page_title="MLB Totals Agent 2026", layout="centered")
 
 st.title("🧠 MLB Totals Agent 2026")
-st.caption("Stable Per-Game Projections • Numeric Model")
+st.caption("Per-Game Pitcher-Driven Projections")
 
 GAME_DATE = st.date_input("Game Date", datetime.now().date())
 FILTER_TEAM = st.text_input("Filter by team (optional)", "")
 
-# Global Adjustments (apply to all games)
-st.subheader("📋 Global Adjustments")
-adj = 0.0
-c1, c2 = st.columns(2)
-with c1:
-    if st.checkbox("Hitter-Friendly Park", value=False, key="global_park"): adj += 0.10
-    if st.checkbox("Warm Temp (>75°F)", value=False, key="global_temp"): adj += 0.07
-    if st.checkbox("Strong Wind Out", value=False, key="global_wind_strong"): adj += 0.15
-    if st.checkbox("Mild Wind Out", value=False, key="global_wind_mild"): adj += 0.08
-with c2:
-    if st.checkbox("Both Lineups Full Strength", value=True, key="global_lineup"): adj += 0.10
-    if st.checkbox("Strong Middle Order", value=False, key="global_middle"): adj += 0.10
-    if st.checkbox("Both Bullpens Thin", value=False, key="global_bullpen"): adj += 0.15
-
 if st.button("🚀 Run Full Analysis", type="primary"):
-    with st.spinner("Analyzing slate..."):
+    with st.spinner("Fetching data and calculating..."):
         games = statsapi.schedule(date=GAME_DATE.isoformat())
         
         try:
             pitching_df = pyb.pitching_stats(GAME_DATE.year, qual=10)
+            st.success(f"Loaded {len(pitching_df)} pitchers")
         except:
             pitching_df = pd.DataFrame()
+            st.warning("Using default pitching values")
         
         for g in games:
             away = g['away_name']
@@ -48,7 +36,7 @@ if st.button("🚀 Run Full Analysis", type="primary"):
             home_sp = g.get('home_probable_pitcher', 'TBD')
             st.caption(f"SP: {away_sp} vs {home_sp}")
             
-            # Pitcher quality variation
+            # Stronger pitcher impact
             base = 4.65
             def get_lambda(sp_name):
                 if not sp_name or pitching_df.empty:
@@ -58,13 +46,14 @@ if st.button("🚀 Run Full Analysis", type="primary"):
                     return base
                 p_plus = float(row.get('Pitching+', 100).iloc[0])
                 s_plus = float(row.get('Stuff+', 100).iloc[0])
-                return base * (100 / p_plus) * (100 / s_plus)**0.3
+                # Stronger weighting
+                return base * (100 / p_plus)**0.6 * (100 / s_plus)**0.4
             
             away_lambda = get_lambda(away_sp)
             home_lambda = get_lambda(home_sp)
             
-            projected = 8.5 + adj + (away_lambda + home_lambda - 9.3)
-            prob_over = 1 - norm.cdf(8.5 + 0.5, projected, 3.0)
+            projected = (away_lambda + home_lambda)
+            prob_over = 1 - norm.cdf(8.5, projected, 3.0)
             edge = prob_over - 0.50
             
             col1, col2, col3 = st.columns(3)
@@ -73,9 +62,9 @@ if st.button("🚀 Run Full Analysis", type="primary"):
             col3.metric("Edge", f"{edge*100:+.1f}%", 
                        delta="✅ BET OVER" if edge > 0.05 else "❌ PASS")
             
-            with st.expander("Details"):
-                st.write(f"Adjustment: **{adj:+.2f}** | Pitching: {away_lambda:.2f} / {home_lambda:.2f}")
+            with st.expander("Pitching Details"):
+                st.write(f"Away λ: {away_lambda:.2f} | Home λ: {home_lambda:.2f}")
             
             st.divider()
 
-st.info("Adjustments above now affect all games. Pitcher quality creates variation.")
+st.info("Projected totals should now vary based on starting pitchers.")
