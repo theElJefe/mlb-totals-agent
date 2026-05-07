@@ -8,7 +8,7 @@ import requests
 import statsapi
 import streamlit as st
 import pytz
-from pybaseball import batting_stats, pitching_stats, schedule_and_record
+from pybaseball import batting_stats, pitching_stats, batting_stats_range, pitching_stats_range, schedule_and_record
 
 st.set_page_config(page_title="MLB Totals Bet Tracker", page_icon="⚾", layout="wide")
 
@@ -235,13 +235,30 @@ def fetch_weather_for_games(home_teams):
 
 @st.cache_data(ttl=14400)
 def fetch_team_metrics(season):
-    bat = batting_stats(season, season)
-    pit = pitching_stats(season, season)
-    bat = bat[[c for c in ["Team", "Name", "PA", "wRC+", "K%", "BB%", "ISO", "wOBA"] if c in bat.columns]]
-    pit = pit[[c for c in ["Team", "Name", "IP", "ERA", "xERA", "FIP", "WHIP", "K/9", "BB/9"] if c in pit.columns]]
-    team_bat = bat.groupby("Team", as_index=False).agg({"PA":"sum", "wRC+":"mean", "K%":"mean", "BB%":"mean", "ISO":"mean", "wOBA":"mean"}) if not bat.empty else pd.DataFrame()
-    team_pit = pit.groupby("Team", as_index=False).agg({"IP":"sum", "ERA":"mean", "xERA":"mean", "FIP":"mean", "WHIP":"mean", "K/9":"mean", "BB/9":"mean"}) if not pit.empty else pd.DataFrame()
-    return team_bat, team_pit
+    try:
+        try:
+            bat = batting_stats(season, season, qual=0)
+            pit = pitching_stats(season, season, qual=0)
+        except Exception:
+            start_dt = f"{season}-03-01"
+            end_dt = f"{season}-11-30"
+            bat = batting_stats_range(start_dt, end_dt)
+            pit = pitching_stats_range(start_dt, end_dt)
+
+        bat = bat[[c for c in ["Team", "Name", "PA", "wRC+", "K%", "BB%", "ISO", "wOBA"] if c in bat.columns]] if bat is not None and not bat.empty else pd.DataFrame()
+        pit = pit[[c for c in ["Team", "Name", "IP", "ERA", "xERA", "FIP", "WHIP", "K/9", "BB/9"] if c in pit.columns]] if pit is not None and not pit.empty else pd.DataFrame()
+
+        team_bat = (
+            bat.groupby("Team", as_index=False).agg({"PA":"sum", "wRC+":"mean", "K%":"mean", "BB%":"mean", "ISO":"mean", "wOBA":"mean"})
+            if not bat.empty and "Team" in bat.columns else pd.DataFrame()
+        )
+        team_pit = (
+            pit.groupby("Team", as_index=False).agg({"IP":"sum", "ERA":"mean", "xERA":"mean", "FIP":"mean", "WHIP":"mean", "K/9":"mean", "BB/9":"mean"})
+            if not pit.empty and "Team" in pit.columns else pd.DataFrame()
+        )
+        return team_bat, team_pit
+    except Exception as e:
+        return pd.DataFrame(), pd.DataFrame()
 
 
 @st.cache_data(ttl=7200)
@@ -318,7 +335,10 @@ bet_log = load_data()
 schedule_df = fetch_schedule_72h()
 odds_df = fetch_odds(api_key, regions=regions, bookmakers=bookmakers) if api_key else pd.DataFrame()
 weather_df = fetch_weather_for_games(schedule_df["home_team"].dropna().unique().tolist()) if not schedule_df.empty else pd.DataFrame()
-team_bat, team_pit = fetch_team_metrics(int(season))
+try:
+    team_bat, team_pit = fetch_team_metrics(int(season))
+except Exception:
+    team_bat, team_pit = pd.DataFrame(), pd.DataFrame()
 ump_info = fetch_umpire_placeholder()
 merged = merge_all(schedule_df, odds_df, weather_df)
 
